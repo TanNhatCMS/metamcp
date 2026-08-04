@@ -28,6 +28,8 @@ on:
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - ".npmrc"
+      - ".pnpmfile.cjs"
       - "turbo.json"
       - ".dockerignore"
       - ".github/workflows/dev-build.yml"
@@ -42,6 +44,8 @@ on:
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - ".npmrc"
+      - ".pnpmfile.cjs"
       - "turbo.json"
       - ".dockerignore"
       - ".github/workflows/dev-build.yml"
@@ -85,7 +89,8 @@ jobs:
     # off via its own `if` so a PR only ever proves the image builds.
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
-      github.event_name == 'pull_request'
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
