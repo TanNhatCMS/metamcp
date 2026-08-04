@@ -1,0 +1,76 @@
+{
+  "required": "Trường này là bắt buộc",
+  "nameRequired": "Tên là bắt buộc",
+  "minLength": "Phải có ít nhất {{min}} ký tự",
+  "maxLength": "Chỉ được tối đa {{max}} ký tự",
+  "email": "Vui lòng nhập địa chỉ email hợp lệ",
+  "urlFormat": "Vui lòng nhập URL hợp lệ",
+  "invalidFormat": "Định dạng không hợp lệ",
+  "serverName": {
+    "required": "Tên máy chủ là bắt buộc",
+    "invalidCharacters": "Tên máy chủ chỉ được chứa chữ cái, chữ số, dấu gạch dưới và dấu gạch ngang",
+    "consecutiveUnderscores": "Tên máy chủ không được chứa các dấu gạch dưới liên tiếp",
+    "alreadyExists": "Tên máy chủ đã tồn tại. Tên máy chủ phải là duy nhất trong phạm vi của bạn."
+  },
+  "command": {
+    "required": "Lệnh là bắt buộc đối với máy chủ stdio",
+    "invalidCommand": "Vui lòng nhập lệnh hợp lệ"
+  },
+  "url": {
+    "required": "URL là bắt buộc đối với loại SSE và Streamable HTTP",
+    "invalidUrl": "URL phải hợp lệ đối với loại SSE và Streamable HTTP"
+  },
+  "namespaceName": {
+    "required": "Tên namespace là bắt buộc",
+    "invalidCharacters": "Tên namespace chỉ được chứa chữ cái, chữ số, dấu gạch dưới và dấu gạch ngang"
+  },
+  "endpointName": {
+    "required": "Tên endpoint là bắt buộc",
+    "invalidCharacters": "Tên endpoint phải tương thích với định dạng URL",
+    "urlCompatible": "Tên phải tương thích với URL"
+  },
+  "apiKeyName": {
+    "required": "Tên khóa API là bắt buộc"
+  },
+  "apiKeyScope": {
+    "required": "Chọn endpoint mà khóa API này được giới hạn phạm vi, hoặc chọn tất cả endpoint",
+    "exclusive": "Chọn một endpoint cụ thể hoặc tất cả endpoint, không được chọn cả hai"
+  },
+  "apiKeyActsAs": {
+    "requiresEndpoint": "Khóa ràng buộc danh tính phải được giới hạn cho một endpoint duy nhất — hãy chọn endpoint cụ thể hoặc xóa người dùng đóng vai",
+    "ownerMismatch": "Khóa ràng buộc danh tính phải thuộc sở hữu của người dùng mà nó đóng vai — khóa công khai hoặc khóa thuộc sở hữu người dùng khác không thể mang liên kết danh tính"
+  },
+  "description": {
+    "tooLong": "Mô tả quá dài"
+  },
+  "password": {
+    "tooShort": "Mật khẩu phải có ít nhất 8 ký tự",
+    "mismatch": "Mật khẩu xác nhận không khớp"
+  },
+  "generic": {
+    "invalid": "Giá trị không hợp lệ",
+    "required": "Trường này là bắt buộc",
+    "tooShort": "Quá ngắn",
+    "tooLong": "Quá dài"
+  },
+  "maxRateSeconds": {
+    "required": "Thời gian giới hạn tốc độ (giây) là bắt buộc",
+    "tooSmall": "Tốc độ tối đa phải lớn hơn 0",
+    "tooLarge": "Tốc độ tối đa phải nhỏ hơn 1000000"
+  },
+  "maxRate": {
+    "required": "Tốc độ tối đa là bắt buộc",
+    "tooSmall": "Tốc độ tối đa phải lớn hơn 0",
+    "tooLarge": "Tốc độ tối đa phải nhỏ hơn 1000000"
+  },
+  "clientMaxRateSeconds": {
+    "required": "Thời gian giới hạn tốc độ client (giây) là bắt buộc",
+    "tooSmall": "Tốc độ tối đa phải lớn hơn 0",
+    "tooLarge": "Tốc độ tối đa phải nhỏ hơn 1000000"
+  },
+  "clientMaxRate": {
+    "required": "Tốc độ tối đa của client là bắt buộc",
+    "tooSmall": "Tốc độ tối đa phải lớn hơn 0",
+    "tooLarge": "Tốc độ tối đa phải nhỏ hơn 1000000"
+  }
+}

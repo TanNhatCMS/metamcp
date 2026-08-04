@@ -1,9 +1,10 @@
 // Client-side i18n utilities
-export const SUPPORTED_LOCALES = ["en", "zh", "ko"] as const;
+export const SUPPORTED_LOCALES = ["en", "vi", "zh", "ko"] as const;
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number];
 
 export const LOCALE_NAMES = {
   en: "English",
+  vi: "Tiếng Việt",
   zh: "中文",
   ko: "한국어",
 } as const;
@@ -72,6 +73,66 @@ export async function loadTranslations(
       validation: (await import("../public/locales/en/validation.json"))
         .default,
     };
+
+  } else if (locale === "vi") {
+    // Load Vietnamese translations with fallback to English
+    const [
+      commonVi,
+      authVi,
+      navigationVi,
+      mcpServersVi,
+      namespacesVi,
+      endpointsVi,
+      apiKeysVi,
+      settingsVi,
+      searchVi,
+      inspectorVi,
+      logsVi,
+      validationVi,
+    ] = await Promise.all([
+      import("../public/locales/vi/common.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/auth.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/navigation.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/mcp-servers.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/namespaces.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/endpoints.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/api-keys.json").catch(() => ({ default: {},
+      })),
+      import("../public/locales/vi/settings.json").catch(() => ({ default: {},
+      })),
+      import("../public/locales/vi/search.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/inspector.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/logs.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/validation.json").catch(() => ({
+        default: {},
+      })),
+    ]);
+    // Get English fallback
+    const englishDict = await loadTranslations("en");
+
+    return {
+      common: { ...englishDict.common, ...commonVi.default },
+      auth: { ...englishDict.auth, ...authVi.default },
+      navigation: { ...englishDict.navigation, ...navigationVi.default },
+      "mcp-servers": { ...englishDict["mcp-servers"], ...mcpServersVi.default },
+      namespaces: { ...englishDict.namespaces, ...namespacesVi.default },
+      endpoints: { ...englishDict.endpoints, ...endpointsVi.default },
+      "api-keys": { ...englishDict["api-keys"], ...apiKeysVi.default },
+      settings: { ...englishDict.settings, ...settingsVi.default },
+      search: { ...englishDict.search, ...searchVi.default },
+      inspector: { ...englishDict.inspector, ...inspectorVi.default },
+      logs: { ...englishDict.logs, ...logsVi.default },
+      validation: { ...englishDict.validation, ...validationVi.default },
+    };
+
   } else if (locale === "zh") {
     // Load Chinese translations with fallback to English
     const [

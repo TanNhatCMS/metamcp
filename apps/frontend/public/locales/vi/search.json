@@ -1,0 +1,79 @@
+{
+  "title": "Khám phá & Tìm kiếm MCP Server (Beta)",
+  "searchPlaceholder": "Tìm kiếm...",
+  "loading": "Đang tải...",
+  "error": "Lỗi",
+  "noResults": "Không tìm thấy kết quả nào",
+  "searchResults": "Kết quả tìm kiếm",
+  "resultsCount": "Tìm thấy {{count}} kết quả",
+  "previousPage": "Trước",
+  "nextPage": "Tiếp",
+  "page": "Trang {{current}} / {{total}}",
+  "searchError": "Đã xảy ra lỗi khi tìm kiếm. Vui lòng thử lại.",
+  "tryAgain": "Thử lại",
+  "clearSearch": "Xóa tìm kiếm",
+  "searchHint": "Nhập từ khóa để tìm kiếm các MCP server",
+  "popularServers": "Máy chủ phổ biến",
+  "recentServers": "Máy chủ gần đây",
+  "categories": "Danh mục",
+  "filters": "Bộ lọc",
+  "sortBy": "Sắp xếp theo",
+  "relevance": "Độ liên quan",
+  "created": "Ngày tạo",
+  "updated": "Ngày cập nhật",
+  "rating": "Đánh giá",
+  "card": {
+    "package": "Gói:",
+    "command": "Lệnh:",
+    "args": "Đối số:",
+    "envVars": "Biến môi trường:",
+    "registry": "Kho lưu trữ (Registry):",
+    "github": "GitHub",
+    "addServer": "Thêm máy chủ"
+  },
+  "dialog": {
+    "title": "Tạo MCP Server",
+    "description": "Cấu hình một máy chủ Model Context Protocol (MCP) mới.",
+    "form": {
+      "name": "Tên",
+      "description": "Mô tả",
+      "type": "Loại",
+      "command": "Lệnh",
+      "arguments": "Đối số",
+      "envVars": "Biến môi trường",
+      "url": "URL",
+      "bearerToken": "Bearer Token (Tùy chọn)",
+      "ownershipLabel": "Quyền sở hữu",
+      "placeholders": {
+        "name": "Nhập tên máy chủ",
+        "description": "Nhập mô tả máy chủ",
+        "selectType": "Chọn loại",
+        "command": "VD: npx",
+        "arguments": "Các đối số phân cách bằng dấu cách",
+        "envVars": "TÊN=giá_trị (mỗi dòng một cặp)",
+        "url": "https://example.com",
+        "bearerToken": "Bearer token"
+      },
+      "ownership": {
+        "private": "Cho cá nhân (Riêng tư)",
+        "public": "Tất cả mọi người (Công khai)",
+        "helpText": "Máy chủ riêng tư chỉ có thể truy cập bởi bạn. Máy chủ công khai có thể truy cập bởi tất cả người dùng."
+      }
+    },
+    "buttons": {
+      "cancel": "Hủy",
+      "create": "Tạo máy chủ",
+      "creating": "Đang tạo..."
+    },
+    "messages": {
+      "success": "Đã tạo MCP Server",
+      "successDescription": "Đã tạo thành công máy chủ \"{{name}}\"",
+      "nameExists": "Tên máy chủ đã tồn tại",
+      "nameExistsDescription": "Vui lòng chọn một tên máy chủ khác",
+      "invalidName": "Tên máy chủ không hợp lệ",
+      "invalidNameDescription": "Tên máy chủ chỉ được chứa chữ cái, chữ số, dấu gạch dưới và dấu gạch ngang",
+      "createFailed": "Không thể tạo máy chủ",
+      "unexpectedError": "Đã xảy ra lỗi không mong muốn"
+    }
+  }
+}
