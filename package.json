@@ -1,6 +1,7 @@
 {
   "name": "metamcp",
   "private": true,
+  "version": "2.5.0",
   "scripts": {
     "build": "turbo run build",
     "dev": "dotenv -e .env.local turbo run dev",
