@@ -1,7 +1,8 @@
 import { betterFetch } from "@better-fetch/fetch";
 import { NextRequest, NextResponse } from "next/server";
+import { SUPPORTED_LOCALES } from "@/lib/i18n";
 
-const locales = ["en", "zh", "ko"];
+const locales = [...SUPPORTED_LOCALES];
 const defaultLocale = "en";
 
 // Get the preferred locale from the request
@@ -25,7 +26,12 @@ function getLocale(request: NextRequest): string {
   // Check Accept-Language header as fallback
   const acceptLanguage = request.headers.get("accept-language");
   if (acceptLanguage) {
-    // Simple language detection - look for zh in accept-language
+    // Simple language detection - look for vi in accept-language
+    if (acceptLanguage.includes("vi")) {
+      return "vi";
+    }
+
+    // Look for zh in accept-language
     if (acceptLanguage.includes("zh")) {
       return "zh";
     }
