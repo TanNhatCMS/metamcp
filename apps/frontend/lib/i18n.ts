@@ -73,7 +73,6 @@ export async function loadTranslations(
       validation: (await import("../public/locales/en/validation.json"))
         .default,
     };
-
   } else if (locale === "vi") {
     // Load Vietnamese translations with fallback to English
     const [
@@ -104,12 +103,16 @@ export async function loadTranslations(
       import("../public/locales/vi/endpoints.json").catch(() => ({
         default: {},
       })),
-      import("../public/locales/vi/api-keys.json").catch(() => ({ default: {},
+      import("../public/locales/vi/api-keys.json").catch(() => ({
+        default: {},
       })),
-      import("../public/locales/vi/settings.json").catch(() => ({ default: {},
+      import("../public/locales/vi/settings.json").catch(() => ({
+        default: {},
       })),
       import("../public/locales/vi/search.json").catch(() => ({ default: {} })),
-      import("../public/locales/vi/inspector.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/inspector.json").catch(() => ({
+        default: {},
+      })),
       import("../public/locales/vi/logs.json").catch(() => ({ default: {} })),
       import("../public/locales/vi/validation.json").catch(() => ({
         default: {},
@@ -132,7 +135,6 @@ export async function loadTranslations(
       logs: { ...englishDict.logs, ...logsVi.default },
       validation: { ...englishDict.validation, ...validationVi.default },
     };
-
   } else if (locale === "zh") {
     // Load Chinese translations with fallback to English
     const [
