@@ -8,7 +8,7 @@ services:
     # session recovery, RBAC, pool-cap env wiring) and nothing errors to tell
     # you. Built from `umbrella` on every push by
     # .github/workflows/umbrella-build.yml.
-    image: ghcr.io/TanNhatCMS/metamcp:latest
+    image: ghcr.io/tannhatcms/metamcp:latest
     pull_policy: always
     env_file:
       - .env
