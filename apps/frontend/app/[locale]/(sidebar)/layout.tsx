@@ -93,15 +93,20 @@ function LiveLogsMenuItem() {
   );
 }
 
+interface UserInfo {
+  name?: string | null;
+  email?: string | null;
+}
+
 function UserInfoFooter() {
   const { t } = useTranslations();
-  const [user, setUser] = useState<unknown>(null);
+  const [user, setUser] = useState<UserInfo | null>(null);
 
   // Get user info
   useEffect(() => {
     authClient.getSession().then((session) => {
       if (session?.data?.user) {
-        setUser(session.data.user);
+        setUser(session.data.user as UserInfo);
       }
     });
   }, []);
