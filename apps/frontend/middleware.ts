@@ -1,6 +1,7 @@
 import { betterFetch } from "@better-fetch/fetch";
 import { NextRequest, NextResponse } from "next/server";
-import { SUPPORTED_LOCALES } from "@/lib/i18n";
+
+import { SUPPORTED_LOCALES, SupportedLocale } from "@/lib/i18n";
 
 const locales = [...SUPPORTED_LOCALES];
 const defaultLocale = "en";
@@ -19,7 +20,7 @@ function getLocale(request: NextRequest): string {
 
   // Check cookies for saved preference first (user's explicit choice)
   const savedLocale = request.cookies.get("preferred-language")?.value;
-  if (savedLocale && locales.includes(savedLocale)) {
+  if (savedLocale && locales.includes(savedLocale as SupportedLocale)) {
     return savedLocale;
   }
 
