@@ -15,8 +15,8 @@
   },
   "devDependencies": {
     "dotenv-cli": "^8.0.0",
-    "prettier": "^3.5.3",
-    "turbo": "^2.9.14",
+    "prettier": "^3.9.6",
+    "turbo": "^2.10.8",
     "typescript": "5.8.2"
   },
   "packageManager": "pnpm@9.0.0",
