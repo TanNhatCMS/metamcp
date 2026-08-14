@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: dataaxiom/ghcr-cleanup-action@v1
         with:
-          owner: Umbrella-IT-Group
+          owner: TanNhatCMS
           packages: metamcp
           delete-untagged: true
           keep-n-tagged: 20

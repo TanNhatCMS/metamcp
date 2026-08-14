@@ -1,0 +1,148 @@
+name: dev — Build & Push (dev branch)
+
+# Builds and publishes the deployable line on every push to `dev`.
+# Image lands at ghcr.io/TanNhatCMS/metamcp:<sha> + :latest.
+# Watchtower on mcp-host-dev (scope=dev) picks up :latest within ~5 min.
+#
+# Also runs build-only (no login, no push, no tags) on PRs targeting
+# `dev` — this is the only build check a PR gets before merge. Until
+# 2026-07-13 the pull_request trigger below existed but the job's `if` only
+# ever matched push events, so no PR ever ran the build (this is why
+# Dependabot PR #54's break reached the prod image unseen). See
+# fix/ci-pr-build-check-20260713.
+
+on:
+  push:
+    branches:
+      - dev
+    # Only rebuild when something that actually feeds the Docker image
+    # changes. Cross-checked against every Dockerfile COPY + the turbo
+    # pipeline's globalDependencies (none outside apps/**, packages/**).
+    # Docs (*.md, docs/**) are also .dockerignore'd, so they never touch
+    # the build output either.
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".npmrc"
+      - ".pnpmfile.cjs"
+      - "turbo.json"
+      - ".dockerignore"
+      - ".github/workflows/dev-build.yml"
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".npmrc"
+      - ".pnpmfile.cjs"
+      - "turbo.json"
+      - ".dockerignore"
+      - ".github/workflows/dev-build.yml"
+  workflow_dispatch:
+
+# Two pushes to `dev` in quick succession used to run fully in
+# parallel with no ordering guarantee — 2026-07-22 saw runs 29887722138
+# and 29887724437 both build and push :latest concurrently, so whichever
+# finished last "won" regardless of which push was actually newer.
+# Grouping by ref serializes runs on the same ref instead of letting them
+# race. PR check runs still cancel-in-progress — a new commit makes the
+# prior check's result moot, so there's nothing lost by killing it. The
+# push-to-dev path is different: it's the only path that publishes
+# :latest, so it QUEUES instead of cancelling. Cancelling gives no grace
+# period, so a cancel landing between the registry push and the :latest
+# manifest update can race the manifest write, and a canceled run also
+# silently drops that commit's own :sha tag + attestation (never written
+# at all — not merely superseded). Queuing means every push to dev
+# still gets its own completed :sha tag and attestation even if a later
+# push finishes after it and reclaims :latest first. Reviewer note: a
+# superseded :sha tag (one :latest has moved past) stays valid and
+# retained in the registry — only a canceled run's tag is actually gone.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # NOTE: lint + check-types are intentionally not gated here. Upstream
+  # `main` has pre-existing eslint warnings under `--max-warnings 0` and
+  # a tRPC type error in apps/frontend/lib/trpc.ts that aren't caused by
+  # our cherry-picks. Upstream itself only runs docker-publish on tags so
+  # these never get noticed there. Tracked as a follow-up — see
+  # UMBRELLA_FORK.md "Our own patches" backlog.
+  build-and-push:
+    # push-to-dev: unchanged — full build + push. pull_request-to-dev:
+    # same job, same build, but every registry-touching step below is gated
+    # off via its own `if` so a PR only ever proves the image builds.
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Login, tag metadata, and attestation only make sense on the push
+      # path — a PR build never touches the registry, so there's nothing
+      # to authenticate, tag, or attest.
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        if: github.event_name == 'push'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=,format=long
+
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # mcp-host-prod is amd64-only; arm64 cross-build doubles CI time
+          # for an artifact nothing consumes. Re-add if we ever publish for
+          # a community arm64 host.
+          platforms: linux/amd64
+          # PR builds verify the Dockerfile still produces an image; empty
+          # tags/labels/cache-to below just drop the corresponding docker
+          # buildx flag (confirmed against build-push-action's own arg
+          # builder), so a PR run stays untagged and never writes cache.
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ github.event_name == 'push' && steps.meta.outputs.tags || '' }}
+          labels: ${{ github.event_name == 'push' && steps.meta.outputs.labels || '' }}
+          cache-from: type=gha,scope=metamcp-dev
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=metamcp-dev' || '' }}
+
+      - uses: actions/attest-build-provenance@v1
+        if: github.event_name == 'push'
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

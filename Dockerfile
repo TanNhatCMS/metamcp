@@ -65,11 +65,11 @@ FROM base AS runner
 WORKDIR /app
 
 # OCI image labels
-LABEL org.opencontainers.image.source="https://github.com/metatool-ai/metamcp"
+LABEL org.opencontainers.image.source="https://github.com/TanNhatCMS/metamcp"
 LABEL org.opencontainers.image.description="MetaMCP - aggregates MCP servers into a unified MetaMCP"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.title="MetaMCP"
-LABEL org.opencontainers.image.vendor="metatool-ai"
+LABEL org.opencontainers.image.vendor="TanNhatCMS"
 
 # Install curl for health checks
 RUN apt-get update && apt-get install -y curl postgresql-client && apt-get clean && rm -rf /var/lib/apt/lists/*

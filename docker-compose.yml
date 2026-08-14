@@ -8,7 +8,7 @@ services:
     # session recovery, RBAC, pool-cap env wiring) and nothing errors to tell
     # you. Built from `umbrella` on every push by
     # .github/workflows/umbrella-build.yml.
-    image: ghcr.io/umbrella-it-group/metamcp:latest
+    image: ghcr.io/tannhatcms/metamcp:latest
     pull_policy: always
     env_file:
       - .env
@@ -21,20 +21,21 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m3t4mcp}
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
-      
+
       # Database configuration (composed from above vars)
       DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:-m3t4mcp}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
-      
+
       # Application URL configuration
       APP_URL: ${APP_URL:-http://localhost:12008}
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
-      
+
       # Auth configuration
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-your-super-secret-key-change-this-in-production}
-      
+
       # Docker networking fix
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}
 
+<<<<<<< HEAD
       # ========================================================================
       # White-label branding (optional)
       # ========================================================================
@@ -62,10 +63,12 @@ services:
       # enumerates public/ once at server start, so the file has to exist
       # before the container starts; swapping it later needs a restart.
 
+=======
+>>>>>>> origin/dev
       # ========================================================================
       # Bootstrap Configuration Examples
       # ========================================================================
-      
+
       # Multiple Users - Define different users with different roles
       # BOOTSTRAP_USERS: |
       #   [
@@ -85,7 +88,7 @@ services:
       #       "name": "Data Analyst"
       #     }
       #   ]
-      
+
       # API Keys - Assign keys to specific users using user_email
       # BOOTSTRAP_API_KEYS: |
       #   [
@@ -109,7 +112,7 @@ services:
       #       "is_public": true
       #     }
       #   ]
-      
+
       # Namespaces - Create user-specific workspaces
       # BOOTSTRAP_NAMESPACES: |
       #   [
@@ -141,7 +144,7 @@ services:
       #       "update": true
       #     }
       #   ]
-      
+
       # Endpoints - Configure endpoints with different owners and auth settings
       # Note: Endpoints can optionally specify which namespace they should be created in
       # BOOTSTRAP_ENDPOINTS: |
@@ -222,7 +225,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-metamcp_user} -d ${POSTGRES_DB:-metamcp_db}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-metamcp_user} -d ${POSTGRES_DB:-metamcp_db}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -1,15 +1,17 @@
 // Client-side i18n utilities
-export const SUPPORTED_LOCALES = ["en", "zh", "ko"] as const;
+export const SUPPORTED_LOCALES = ["en", "vi", "zh", "ko"] as const;
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number];
 
 export const LOCALE_NAMES = {
   en: "English",
+  vi: "Tiếng Việt",
   zh: "中文",
   ko: "한국어",
 } as const;
 
 // Type for translations
 export type Translations = {
+<<<<<<< HEAD
   common: Record<string, any>;
   auth: Record<string, any>;
   navigation: Record<string, any>;
@@ -23,6 +25,20 @@ export type Translations = {
   inspector: Record<string, any>;
   logs: Record<string, any>;
   validation: Record<string, any>;
+=======
+  common: Record<string, unknown>;
+  auth: Record<string, unknown>;
+  navigation: Record<string, unknown>;
+  "mcp-servers": Record<string, unknown>;
+  namespaces: Record<string, unknown>;
+  endpoints: Record<string, unknown>;
+  "api-keys": Record<string, unknown>;
+  settings: Record<string, unknown>;
+  search: Record<string, unknown>;
+  inspector: Record<string, unknown>;
+  logs: Record<string, unknown>;
+  validation: Record<string, unknown>;
+>>>>>>> origin/dev
 };
 
 // Utility functions for working with localized paths
@@ -74,6 +90,68 @@ export async function loadTranslations(
       logs: (await import("../public/locales/en/logs.json")).default,
       validation: (await import("../public/locales/en/validation.json"))
         .default,
+    };
+  } else if (locale === "vi") {
+    // Load Vietnamese translations with fallback to English
+    const [
+      commonVi,
+      authVi,
+      navigationVi,
+      mcpServersVi,
+      namespacesVi,
+      endpointsVi,
+      apiKeysVi,
+      settingsVi,
+      searchVi,
+      inspectorVi,
+      logsVi,
+      validationVi,
+    ] = await Promise.all([
+      import("../public/locales/vi/common.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/auth.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/navigation.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/mcp-servers.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/namespaces.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/endpoints.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/api-keys.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/settings.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/search.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/inspector.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/logs.json").catch(() => ({ default: {} })),
+      import("../public/locales/vi/validation.json").catch(() => ({
+        default: {},
+      })),
+    ]);
+    // Get English fallback
+    const englishDict = await loadTranslations("en");
+
+    return {
+      common: { ...englishDict.common, ...commonVi.default },
+      auth: { ...englishDict.auth, ...authVi.default },
+      navigation: { ...englishDict.navigation, ...navigationVi.default },
+      "mcp-servers": { ...englishDict["mcp-servers"], ...mcpServersVi.default },
+      namespaces: { ...englishDict.namespaces, ...namespacesVi.default },
+      endpoints: { ...englishDict.endpoints, ...endpointsVi.default },
+      "api-keys": { ...englishDict["api-keys"], ...apiKeysVi.default },
+      settings: { ...englishDict.settings, ...settingsVi.default },
+      search: { ...englishDict.search, ...searchVi.default },
+      inspector: { ...englishDict.inspector, ...inspectorVi.default },
+      logs: { ...englishDict.logs, ...logsVi.default },
+      validation: { ...englishDict.validation, ...validationVi.default },
     };
   } else if (locale === "zh") {
     // Load Chinese translations with fallback to English
@@ -230,13 +308,13 @@ export function getTranslation(
   params?: Record<string, string | number>,
 ): string {
   const parts = key.split(":");
-  let value: any = dictionary;
+  let value: unknown = dictionary;
 
   // First, navigate to the correct namespace (before the colon)
   if (parts.length > 1) {
     const namespace = parts[0]!;
     if (value && typeof value === "object" && namespace in value) {
-      value = value[namespace];
+      value = (value as Record<string, unknown>)[namespace];
     } else {
       return key; // Return the key if namespace not found
     }
@@ -245,7 +323,7 @@ export function getTranslation(
     const nestedKeys = parts[1]!.split(".");
     for (const k of nestedKeys) {
       if (value && typeof value === "object" && k in value) {
-        value = value[k];
+        value = (value as Record<string, unknown>)[k];
       } else {
         return key; // Return the key if translation not found
       }
@@ -255,7 +333,7 @@ export function getTranslation(
     const keys = key.split(".");
     for (const k of keys) {
       if (value && typeof value === "object" && k in value) {
-        value = value[k];
+        value = (value as Record<string, unknown>)[k];
       } else {
         return key; // Return the key if translation not found
       }

@@ -100,15 +100,20 @@ function LiveLogsMenuItem() {
   );
 }
 
+interface UserInfo {
+  name?: string | null;
+  email?: string | null;
+}
+
 function UserInfoFooter() {
   const { t } = useTranslations();
-  const [user, setUser] = useState<any>(null);
+  const [user, setUser] = useState<UserInfo | null>(null);
 
   // Get user info
   useEffect(() => {
     authClient.getSession().then((session) => {
       if (session?.data?.user) {
-        setUser(session.data.user);
+        setUser(session.data.user as UserInfo);
       }
     });
   }, []);
@@ -126,7 +131,7 @@ function UserInfoFooter() {
             <LanguageSwitcher />
             <ThemeToggle />
           </div>
-          <p className="text-xs text-muted-foreground">v2.4.22</p>
+          <p className="text-xs text-muted-foreground">v2.5.0</p>
         </div>
         <Separator />
         {user && (
@@ -188,7 +193,11 @@ export default function SidebarLayout({
               priority
               className="h-10 w-auto"
             />
+<<<<<<< HEAD
             <h2 className="text-xl font-semibold leading-tight">{orgName}</h2>
+=======
+            <h2 className="text-xl font-semibold leading-tight">Umbrella IT</h2>
+>>>>>>> origin/dev
           </div>
         </SidebarHeader>
 
