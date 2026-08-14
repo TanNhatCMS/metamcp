@@ -10,6 +10,7 @@
     "dev:docker:clean": "docker compose -f docker-compose.dev.yml down -v --remove-orphans",
     "lint": "turbo run lint",
     "lint:fix": "turbo run lint:fix",
+    "test": "turbo run test",
     "format": "prettier --write \"**/*.{ts,tsx,md}\"",
     "check-types": "turbo run check-types"
   },
@@ -23,28 +24,34 @@
   "engines": {
     "node": ">=18"
   },
-  "overrides": {
-    "@eslint/plugin-kit@<0.3.4": "^0.3.4",
-    "ajv@6": "^6.14.0",
-    "brace-expansion@1": "^1.1.13",
-    "brace-expansion@2": "^2.0.3",
-    "defu@<6.1.5": "^6.1.5",
-    "esbuild@<0.25.0": "^0.25.0",
-    "flatted@<3.4.2": "^3.4.2",
-    "glob@10": "^10.5.0",
-    "js-cookie@<3.0.7": "^3.0.7",
-    "js-yaml@4": "^4.2.0",
-    "lodash@<4.18.0": "^4.18.0",
-    "minimatch@3": "^3.1.4",
-    "minimatch@9": "^9.0.7",
-    "path-to-regexp@8": "^8.4.0",
-    "picomatch@2": "^2.3.2",
-    "picomatch@4": "^4.0.4",
-    "postcss@<8.5.10": "^8.5.10",
-    "prismjs@<1.30.0": "^1.30.0",
-    "qs@6": "^6.15.2",
-    "rollup@4": "^4.59.0",
-    "tar@7": "^7.5.16",
-    "vite@7": "^7.3.5"
+  "pnpm": {
+    "overrides": {
+      "@eslint/plugin-kit@<0.3.4": "^0.3.4",
+      "@hono/node-server@1": "~1.19.15",
+      "ajv@6": "^6.14.0",
+      "brace-expansion@1": "^1.1.18",
+      "brace-expansion@2": "^2.1.4",
+      "defu@<6.1.5": "^6.1.5",
+      "esbuild@<0.25.0": "^0.25.0",
+      "fast-uri@3": "~3.1.5",
+      "flatted@<3.4.2": "^3.4.2",
+      "glob@10": "^10.5.0",
+      "hono@4": "~4.12.34",
+      "ip-address@10": "~10.3.1",
+      "js-cookie@<3.0.7": "^3.0.7",
+      "js-yaml@4": "^4.3.1",
+      "lodash@<4.18.0": "^4.18.0",
+      "minimatch@3": "^3.1.4",
+      "minimatch@9": "^9.0.7",
+      "path-to-regexp@8": "^8.4.0",
+      "picomatch@2": "^2.3.2",
+      "picomatch@4": "^4.0.4",
+      "postcss@<8.5.23": "^8.5.23",
+      "prismjs@<1.30.0": "^1.30.0",
+      "qs@6": "^6.15.2",
+      "rollup@4": "^4.59.0",
+      "tar@7": "^7.5.21",
+      "vite@7": "^7.3.5"
+    }
   }
 }

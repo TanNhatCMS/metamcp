@@ -18,6 +18,7 @@ export type Translations = {
   namespaces: Record<string, unknown>;
   endpoints: Record<string, unknown>;
   "api-keys": Record<string, unknown>;
+  "oauth-clients": Record<string, unknown>;
   settings: Record<string, unknown>;
   search: Record<string, unknown>;
   inspector: Record<string, unknown>;
@@ -66,6 +67,8 @@ export async function loadTranslations(
         .default,
       endpoints: (await import("../public/locales/en/endpoints.json")).default,
       "api-keys": (await import("../public/locales/en/api-keys.json")).default,
+      "oauth-clients": (await import("../public/locales/en/oauth-clients.json"))
+        .default,
       settings: (await import("../public/locales/en/settings.json")).default,
       search: (await import("../public/locales/en/search.json")).default,
       inspector: (await import("../public/locales/en/inspector.json")).default,
@@ -145,6 +148,7 @@ export async function loadTranslations(
       namespacesZh,
       endpointsZh,
       apiKeysZh,
+      oauthClientsZh,
       settingsZh,
       searchZh,
       inspectorZh,
@@ -166,6 +170,9 @@ export async function loadTranslations(
         default: {},
       })),
       import("../public/locales/zh/api-keys.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/zh/oauth-clients.json").catch(() => ({
         default: {},
       })),
       import("../public/locales/zh/settings.json").catch(() => ({
@@ -192,6 +199,10 @@ export async function loadTranslations(
       namespaces: { ...englishDict.namespaces, ...namespacesZh.default },
       endpoints: { ...englishDict.endpoints, ...endpointsZh.default },
       "api-keys": { ...englishDict["api-keys"], ...apiKeysZh.default },
+      "oauth-clients": {
+        ...englishDict["oauth-clients"],
+        ...oauthClientsZh.default,
+      },
       settings: { ...englishDict.settings, ...settingsZh.default },
       search: { ...englishDict.search, ...searchZh.default },
       inspector: { ...englishDict.inspector, ...inspectorZh.default },
@@ -208,6 +219,7 @@ export async function loadTranslations(
       namespacesKo,
       endpointsKo,
       apiKeysKo,
+      oauthClientsKo,
       settingsKo,
       searchKo,
       inspectorKo,
@@ -229,6 +241,9 @@ export async function loadTranslations(
         default: {},
       })),
       import("../public/locales/ko/api-keys.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/ko/oauth-clients.json").catch(() => ({
         default: {},
       })),
       import("../public/locales/ko/settings.json").catch(() => ({
@@ -255,6 +270,10 @@ export async function loadTranslations(
       namespaces: { ...englishDict.namespaces, ...namespacesKo.default },
       endpoints: { ...englishDict.endpoints, ...endpointsKo.default },
       "api-keys": { ...englishDict["api-keys"], ...apiKeysKo.default },
+      "oauth-clients": {
+        ...englishDict["oauth-clients"],
+        ...oauthClientsKo.default,
+      },
       settings: { ...englishDict.settings, ...settingsKo.default },
       search: { ...englishDict.search, ...searchKo.default },
       inspector: { ...englishDict.inspector, ...inspectorKo.default },
