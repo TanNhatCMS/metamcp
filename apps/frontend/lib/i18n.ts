@@ -11,21 +11,6 @@ export const LOCALE_NAMES = {
 
 // Type for translations
 export type Translations = {
-<<<<<<< HEAD
-  common: Record<string, any>;
-  auth: Record<string, any>;
-  navigation: Record<string, any>;
-  "mcp-servers": Record<string, any>;
-  namespaces: Record<string, any>;
-  endpoints: Record<string, any>;
-  "api-keys": Record<string, any>;
-  "oauth-clients": Record<string, any>;
-  settings: Record<string, any>;
-  search: Record<string, any>;
-  inspector: Record<string, any>;
-  logs: Record<string, any>;
-  validation: Record<string, any>;
-=======
   common: Record<string, unknown>;
   auth: Record<string, unknown>;
   navigation: Record<string, unknown>;
@@ -33,12 +18,12 @@ export type Translations = {
   namespaces: Record<string, unknown>;
   endpoints: Record<string, unknown>;
   "api-keys": Record<string, unknown>;
+  "oauth-clients": Record<string, unknown>;
   settings: Record<string, unknown>;
   search: Record<string, unknown>;
   inspector: Record<string, unknown>;
   logs: Record<string, unknown>;
   validation: Record<string, unknown>;
->>>>>>> origin/dev
 };
 
 // Utility functions for working with localized paths

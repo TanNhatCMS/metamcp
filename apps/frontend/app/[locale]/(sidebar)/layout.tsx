@@ -193,11 +193,7 @@ export default function SidebarLayout({
               priority
               className="h-10 w-auto"
             />
-<<<<<<< HEAD
             <h2 className="text-xl font-semibold leading-tight">{orgName}</h2>
-=======
-            <h2 className="text-xl font-semibold leading-tight">Umbrella IT</h2>
->>>>>>> origin/dev
           </div>
         </SidebarHeader>
 
