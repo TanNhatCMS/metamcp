@@ -5,6 +5,7 @@
   "metamcpEndpoints": "MetaMCP Endpoint",
   "mcpInspector": "MCP Inspector",
   "apiKeys": "Khóa API",
+  "oauthClients": "Ứng dụng OAuth",
   "settings": "Cài đặt",
   "liveLogs": "Nhật ký trực tiếp",
   "application": "Ứng dụng",

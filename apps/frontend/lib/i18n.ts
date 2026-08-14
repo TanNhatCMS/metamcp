@@ -86,6 +86,7 @@ export async function loadTranslations(
       namespacesVi,
       endpointsVi,
       apiKeysVi,
+      oauthClientsVi,
       settingsVi,
       searchVi,
       inspectorVi,
@@ -107,6 +108,9 @@ export async function loadTranslations(
         default: {},
       })),
       import("../public/locales/vi/api-keys.json").catch(() => ({
+        default: {},
+      })),
+      import("../public/locales/vi/oauth-clients.json").catch(() => ({
         default: {},
       })),
       import("../public/locales/vi/settings.json").catch(() => ({
@@ -132,6 +136,10 @@ export async function loadTranslations(
       namespaces: { ...englishDict.namespaces, ...namespacesVi.default },
       endpoints: { ...englishDict.endpoints, ...endpointsVi.default },
       "api-keys": { ...englishDict["api-keys"], ...apiKeysVi.default },
+      "oauth-clients": {
+        ...englishDict["oauth-clients"],
+        ...oauthClientsVi.default,
+      },
       settings: { ...englishDict.settings, ...settingsVi.default },
       search: { ...englishDict.search, ...searchVi.default },
       inspector: { ...englishDict.inspector, ...inspectorVi.default },
