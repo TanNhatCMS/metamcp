@@ -1,0 +1,14 @@
+{
+  "exploreMcpServers": "Khám phá MCP Server (beta)",
+  "mcpServers": "MCP Server",
+  "metamcpNamespaces": "MetaMCP Namespace",
+  "metamcpEndpoints": "MetaMCP Endpoint",
+  "mcpInspector": "MCP Inspector",
+  "apiKeys": "Khóa API",
+  "oauthClients": "Ứng dụng OAuth",
+  "settings": "Cài đặt",
+  "liveLogs": "Nhật ký trực tiếp",
+  "application": "Ứng dụng",
+  "logout": "Đăng xuất",
+  "profile": "Hồ sơ"
+}

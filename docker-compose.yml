@@ -8,7 +8,7 @@ services:
     # session recovery, RBAC, pool-cap env wiring) and nothing errors to tell
     # you. Built from `umbrella` on every push by
     # .github/workflows/umbrella-build.yml.
-    image: ghcr.io/umbrella-it-group/metamcp:latest
+    image: ghcr.io/tannhatcms/metamcp:latest
     pull_policy: always
     env_file:
       - .env
@@ -30,14 +30,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
-      
+
       # Database configuration (composed from above vars)
       DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
       
       # Application URL configuration
       APP_URL: ${APP_URL:-http://localhost:12008}
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
-      
+
       # Auth configuration
       #
       # BETTER_AUTH_SECRET is REQUIRED and deliberately has no fallback, for
@@ -108,7 +108,7 @@ services:
       # ========================================================================
       # Bootstrap Configuration Examples
       # ========================================================================
-      
+
       # Multiple Users - Define different users with different roles
       # BOOTSTRAP_USERS: |
       #   [
@@ -128,7 +128,7 @@ services:
       #       "name": "Data Analyst"
       #     }
       #   ]
-      
+
       # API Keys - Assign keys to specific users using user_email
       #
       # "key" is REQUIRED and is a value YOU generate (min 32 chars, high
@@ -157,7 +157,7 @@ services:
       #       "key": "sk_mt_REPLACE_WITH_A_THIRD_SECRET"
       #     }
       #   ]
-      
+
       # Namespaces - Create user-specific workspaces
       # BOOTSTRAP_NAMESPACES: |
       #   [
@@ -189,7 +189,7 @@ services:
       #       "update": true
       #     }
       #   ]
-      
+
       # Endpoints - Configure endpoints with different owners and auth settings
       # Note: Endpoints can optionally specify which namespace they should be created in
       # BOOTSTRAP_ENDPOINTS: |
@@ -271,7 +271,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-metamcp_user} -d ${POSTGRES_DB:-metamcp_db}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-metamcp_user} -d ${POSTGRES_DB:-metamcp_db}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5

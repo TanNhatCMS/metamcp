@@ -53,7 +53,6 @@
   "noServers": "未找到 MCP 服务器",
   "createFirstServer": "创建您的第一个 MCP 服务器开始使用",
   "serverDetails": "服务器详情",
-  "tools": "工具",
   "noTools": "暂无工具",
   "testConnection": "测试连接",
   "connectionStatus": "连接状态",
