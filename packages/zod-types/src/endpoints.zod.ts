@@ -87,6 +87,19 @@ export const CreateEndpointRequestSchema = z.object({
   user_id: z.string().nullable().optional(),
 });
 
+// DELIBERATELY WITHOUT `restricted` (migration 0033). This is the wire shape
+// for `endpoints.list` / `endpoints.get`, which are protectedProcedure and
+// therefore MEMBER-visible. Which endpoints are gated, and which are not, is
+// the authorization policy itself: the whole reason every procedure on the
+// access-groups router is adminProcedure is that a member has no business
+// reading that map, and shipping the same bit here through a member-visible
+// endpoint would hand it back one row at a time.
+//
+// The middleware does not read this schema. It reads `DatabaseEndpointSchema`
+// below, off the row the lookup middleware stamps on the request, which still
+// carries `restricted` as a REQUIRED field. Enforcement is unaffected.
+//
+// The admin surface reads it through `accessGroups.getEndpointAccess`.
 export const EndpointSchema = z.object({
   uuid: z.string(),
   name: z.string(),
@@ -121,6 +134,14 @@ export const CreateEndpointResponseSchema = z.object({
   success: z.boolean(),
   data: EndpointSchema.optional(),
   message: z.string().optional(),
+  // PARTIAL success: the endpoint exists, but an optional companion step did
+  // not complete (today: the auto-generated MCP server, whose bearer key
+  // could not be minted). It is not a `success: false` — the endpoint really
+  // was created, and reporting failure would send the caller into a retry
+  // that hits "Endpoint name already exists". It is not folded into
+  // `message` either, because `message` is populated on the happy path too
+  // and callers would have to string-match to tell the two apart.
+  warning: z.string().optional(),
 });
 
 export const ListEndpointsResponseSchema = z.object({
@@ -257,6 +278,13 @@ export const DatabaseEndpointSchema = z.object({
   client_max_rate_strategy_key: z.string().nullable().optional(),
   enable_oauth: z.boolean(),
   use_query_param_auth: z.boolean(),
+  // REQUIRED, not optional, and that is the point. `middleware/api-key-oauth`
+  // reads this off the endpoint row the lookup middleware stamped on the
+  // request, and every repository read projects columns explicitly — so an
+  // optional field here would let a projection that forgot `restricted` compile
+  // and then fail OPEN at runtime, admitting an OAuth caller to an endpoint an
+  // operator had switched on. Required makes that a type error at the read site.
+  restricted: z.boolean(),
   created_at: z.date(),
   updated_at: z.date(),
   user_id: z.string().nullable(),

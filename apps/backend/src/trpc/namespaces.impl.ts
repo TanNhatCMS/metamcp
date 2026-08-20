@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   CreateNamespaceRequestSchema,
   CreateNamespaceResponseSchema,
@@ -28,6 +29,7 @@ import {
   toolsRepository,
 } from "../db/repositories";
 import { NamespacesSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
 import {
   clearOverrideCache,
   mapOverrideNameToOriginal,
@@ -38,6 +40,7 @@ export const namespacesImplementations = {
   create: async (
     input: z.infer<typeof CreateNamespaceRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateNamespaceResponseSchema>> => {
     try {
       // Determine user ownership based on input.user_id or default to current user
@@ -107,6 +110,17 @@ export const namespacesImplementations = {
           );
           // Don't fail the entire create operation if idle server creation fails
         });
+
+      emitAdminEvent(actor, {
+        action: "namespace.create",
+        target_type: "namespace",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          owner_user_id: effectiveUserId,
+          mcp_server_count: input.mcpServerUuids?.length ?? 0,
+        },
+      });
 
       return {
         success: true as const,
@@ -248,6 +262,7 @@ export const namespacesImplementations = {
       uuid: string;
     },
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteNamespaceResponseSchema>> => {
     try {
       // First, check if the namespace exists and user has permission to delete it
@@ -301,6 +316,13 @@ export const namespacesImplementations = {
         `Cleared tool overrides cache for deleted namespace ${input.uuid}`,
       );
 
+      emitAdminEvent(actor, {
+        action: "namespace.delete",
+        target_type: "namespace",
+        target_id: input.uuid,
+        detail: { name: existingNamespace.name },
+      });
+
       return {
         success: true as const,
         message: "Namespace deleted successfully",
@@ -318,6 +340,7 @@ export const namespacesImplementations = {
   update: async (
     input: z.infer<typeof UpdateNamespaceRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceResponseSchema>> => {
     try {
       // First, check if the namespace exists and user has permission to update it
@@ -431,6 +454,16 @@ export const namespacesImplementations = {
         `Cleared tool overrides cache for updated namespace ${input.uuid}`,
       );
 
+      emitAdminEvent(actor, {
+        action: "namespace.update",
+        target_type: "namespace",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          mcp_server_count: input.mcpServerUuids?.length ?? 0,
+        },
+      });
+
       return {
         success: true as const,
         data: NamespacesSerializer.serializeNamespace(result),
@@ -449,6 +482,7 @@ export const namespacesImplementations = {
   updateServerStatus: async (
     input: z.infer<typeof UpdateNamespaceServerStatusRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceServerStatusResponseSchema>> => {
     try {
       // First, check if user has permission to update this namespace
@@ -519,6 +553,16 @@ export const namespacesImplementations = {
           // Don't fail the entire operation if OpenAPI session invalidation fails
         });
 
+      // ACTIVE/INACTIVE decides whether a backend MCP server is reachable
+      // through this namespace at all, so it is an availability change to the
+      // data plane, not a cosmetic one.
+      emitAdminEvent(actor, {
+        action: "namespace.server_status",
+        target_type: "namespace",
+        target_id: input.namespaceUuid,
+        detail: { server_uuid: input.serverUuid, status: input.status },
+      });
+
       return {
         success: true as const,
         message: "Server status updated successfully",
@@ -536,6 +580,7 @@ export const namespacesImplementations = {
   updateToolStatus: async (
     input: z.infer<typeof UpdateNamespaceToolStatusRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceToolStatusResponseSchema>> => {
     try {
       // First, check if user has permission to update this namespace
@@ -575,6 +620,17 @@ export const namespacesImplementations = {
         };
       }
 
+      emitAdminEvent(actor, {
+        action: "namespace.tool_status",
+        target_type: "namespace",
+        target_id: input.namespaceUuid,
+        detail: {
+          tool_uuid: input.toolUuid,
+          server_uuid: input.serverUuid,
+          status: input.status,
+        },
+      });
+
       return {
         success: true as const,
         message: "Tool status updated successfully",
@@ -592,6 +648,7 @@ export const namespacesImplementations = {
   updateToolOverrides: async (
     input: z.infer<typeof UpdateNamespaceToolOverridesRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceToolOverridesResponseSchema>> => {
     try {
       // First, check if user has permission to update this namespace
@@ -639,6 +696,20 @@ export const namespacesImplementations = {
         `Cleared tool overrides cache for namespace ${input.namespaceUuid} after updating tool overrides`,
       );
 
+      // An override RENAMES a tool as the client sees it, so it can make one
+      // tool answer to another one's name. The overridden name is recorded;
+      // the description/annotation bodies are not, to keep the row small.
+      emitAdminEvent(actor, {
+        action: "namespace.tool_overrides",
+        target_type: "namespace",
+        target_id: input.namespaceUuid,
+        detail: {
+          tool_uuid: input.toolUuid,
+          server_uuid: input.serverUuid,
+          override_name: input.overrideName ?? null,
+        },
+      });
+
       return {
         success: true as const,
         message: "Tool overrides updated successfully",
@@ -656,6 +727,7 @@ export const namespacesImplementations = {
   refreshTools: async (
     input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
     userId: string,
+    isAdmin: boolean,
   ): Promise<z.infer<typeof RefreshNamespaceToolsResponseSchema>> => {
     try {
       // First, check if user has permission to refresh tools for this namespace
@@ -667,6 +739,31 @@ export const namespacesImplementations = {
         return {
           success: false as const,
           message: "Namespace not found",
+        };
+      }
+
+      // A PUBLIC namespace has no `user_id`, so the ownership test below is
+      // vacuously true for every caller and each of them reached the writes
+      // underneath. Those writes are not a refresh of what the upstream
+      // server reported: the tool list arrives IN THE REQUEST, and it is
+      // upserted straight into the shared `tools` catalog (description and
+      // tool_schema overwritten per mcp_server_uuid + name, on a server
+      // resolved by NAME across the whole estate) and then written as ACTIVE
+      // namespace tool mappings. So a caller reaching this on a public
+      // namespace can rewrite what every downstream MCP client is told a
+      // tool does, and switch back on the mappings `updateToolStatus`
+      // (adminProcedure) exists to switch off. The role is threaded from the
+      // router rather than re-derived here, matching `mcpServers.reconnect`.
+      //
+      // This costs no member workflow: the only producer of this payload is
+      // the namespace page's MetaMCP connection, which rides
+      // `/mcp-proxy/metamcp/:uuid/sse` and has been admin-only since that
+      // router's gate (routers/mcp-proxy.ts).
+      if (!namespace.user_id && !isAdmin) {
+        return {
+          success: false as const,
+          message:
+            "Access denied: Only an administrator can refresh tools for a public namespace",
         };
       }
 

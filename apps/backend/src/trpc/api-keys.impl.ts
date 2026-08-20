@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
@@ -21,6 +22,8 @@ import {
   usersRepository,
 } from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
+import { resolveActsAsUserId } from "../lib/api-key-identity";
+import { emitAdminEvent } from "../lib/audit/admin-event";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -29,6 +32,7 @@ export const apiKeysImplementations = {
     input: z.infer<typeof CreateApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> => {
     // RBAC on the mint path. `input.user_id === null` is the public
     // ('everyone') selection; `undefined` means "private to me". A member may
@@ -173,6 +177,24 @@ export const apiKeysImplementations = {
         is_active: true,
       });
 
+      // The row exists — emit before serialising, since the serialiser is the
+      // only thing between here and a response body carrying the FULL key.
+      // `detail` gets the uuid, the name and the scope that decides how far
+      // the key reaches; it must never get `result.key`, which is the
+      // credential itself and is returned to the caller exactly once.
+      emitAdminEvent(actor, {
+        action: "apikey.create",
+        target_type: "api_key",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          owner_user_id: apiKeyUserId,
+          endpoint_uuid: input.endpoint_uuid ?? null,
+          all_endpoints: input.all_endpoints === true,
+          acts_as_user_id: input.acts_as_user_id ?? null,
+        },
+      });
+
       return ApiKeysSerializer.serializeCreateApiKeyResponse(result);
     } catch (error) {
       // Preserve an intentional authorization error's code; only wrap the
@@ -196,8 +218,8 @@ export const apiKeysImplementations = {
   // reasoning was wrong: a public key being distributed to its intended
   // consumers out-of-band is not the same as every self-registered member
   // being able to read it on demand, and `list` is reachable by any member.
-  // A pentest recovered three live gateway-wide production keys through
-  // exactly this call (2026-08-13). The convenience is gone deliberately;
+  // A member-role caller could read live gateway-wide production keys through
+  // exactly this call. The convenience is gone deliberately;
   // an operator who needs gateway access gets an endpoint-scoped key minted
   // for them instead (create is admin-only and scope is mandatory).
   list: async (
@@ -235,6 +257,7 @@ export const apiKeysImplementations = {
     input: z.infer<typeof UpdateApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateApiKeyResponseSchema>> => {
     try {
       // Admins bypass the ownership WHERE (may edit / revoke any key); members
@@ -249,6 +272,17 @@ export const apiKeysImplementations = {
             is_active: input.is_active,
           });
 
+      // Deactivating a key is a REVOCATION and gets its own verb — during an
+      // investigation "which credentials were killed, by whom, when" is a
+      // question asked directly of the action column, and burying it inside a
+      // generic `apikey.update` alongside renames would make it un-greppable.
+      emitAdminEvent(actor, {
+        action: input.is_active === false ? "apikey.revoke" : "apikey.update",
+        target_type: "api_key",
+        target_id: input.uuid,
+        detail: { name: result.name, is_active: result.is_active },
+      });
+
       return ApiKeysSerializer.serializeApiKey(result);
     } catch (error) {
       logger.error("Error updating API key:", error);
@@ -262,6 +296,7 @@ export const apiKeysImplementations = {
     input: z.infer<typeof DeleteApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteApiKeyResponseSchema>> => {
     try {
       // Admins bypass the ownership WHERE (may delete / revoke any key);
@@ -271,6 +306,13 @@ export const apiKeysImplementations = {
       } else {
         await apiKeysRepository.delete(input.uuid, userId);
       }
+
+      emitAdminEvent(actor, {
+        action: "apikey.delete",
+        target_type: "api_key",
+        target_id: input.uuid,
+        detail: { as_admin: isAdmin },
+      });
 
       return {
         success: true,
@@ -291,6 +333,57 @@ export const apiKeysImplementations = {
   ): Promise<z.infer<typeof ValidateApiKeyResponseSchema>> => {
     try {
       const result = await apiKeysRepository.validateApiKey(input.key);
+
+      // Disabled-identity gate (migration 0027). The DATA plane already
+      // refuses such a key — the api-key/OAuth middleware runs
+      // findDisabledIdentity around validateApiKey and answers 403 with an
+      // account_disabled audit event — so this procedure is the last surface
+      // that would still call such a key "valid". Nothing authenticates
+      // through it (it is an oracle for the admin UI), which is why the check
+      // belongs HERE and not inside validateApiKey: pushing it into the
+      // repository would add a users read to the hot auth path and strip the
+      // middleware's containment response of the very audit event an
+      // investigation greps for. The cost is at most two queries on a cold
+      // path, and the benefit is that the two planes give the same answer to
+      // the disabled-identity question. They still differ deliberately
+      // elsewhere: the middleware also enforces endpoint scope, which this
+      // procedure has no endpoint to check against and does not disclose (see
+      // the note on the return below).
+      //
+      // Checked against the SAME candidate list the data plane refuses on —
+      // the key's owner AND, for an admin key carrying an acts-as binding,
+      // the identity it impersonates. Checking only the owner left the exact
+      // hole this gate exists to close: an enabled admin's scoped key would
+      // still be reported valid while acting as an account that was just
+      // locked out, and the middleware would refuse the very same key.
+      if (result.valid) {
+        // resolveActsAsUserId is the very function the data-plane middleware
+        // runs, shared rather than reimplemented so the identity-requires-
+        // scope pairing (migration 0024) cannot drift between the planes: it
+        // returns undefined unless endpoint_uuid is non-NULL, so an unscoped
+        // key is unaffected and no second query is spent on it.
+        for (const candidateUserId of [
+          result.user_id,
+          resolveActsAsUserId(result),
+        ]) {
+          // user_id NULL is a public / service key with no owner to disable,
+          // and an unbound key has no acts-as target. There is nothing to
+          // check, and calling isDisabled(undefined) would match no row and
+          // fail CLOSED, silently invalidating every public key.
+          if (!candidateUserId) continue;
+          if (await usersRepository.isDisabled(candidateUserId)) {
+            // Bare not-valid, with no user_id / key_uuid: `validate` is a
+            // protectedProcedure any member may call with an arbitrary key
+            // string, so a distinct "exists but an identity behind it is
+            // disabled" answer would widen the key oracle instead of
+            // narrowing it. Such a key is indistinguishable from a key that
+            // does not exist — including which of the two identities was the
+            // disabled one.
+            return { valid: false };
+          }
+        }
+      }
+
       // Deliberately does NOT echo the key's endpoint scope. `validate` is a
       // protectedProcedure any member can call with an arbitrary key string;
       // returning endpoint_uuid would widen the existing key oracle (a caller

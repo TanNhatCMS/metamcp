@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "crypto";
 import express from "express";
 
+import { resolveClientIp } from "@/middleware/audit-context.middleware";
 import logger from "@/utils/logger";
 
 // OAuth 2.0 Authorization Parameters interface
@@ -61,6 +62,25 @@ export function generateSecureClientSecret(): string {
 /**
  * Validate redirect URI according to OAuth 2.1 security requirements
  * Prevents open redirect vulnerabilities
+ *
+ * SUPERSEDED AT REGISTRATION by `isAllowedRedirectUri` below, which is the
+ * only checker `buildClientRegistration` calls.
+ *
+ * STILL LIVE AT `/oauth/authorize`, where it now runs ALONGSIDE
+ * `isAllowedRedirectUri` rather than instead of it. The follow-up this comment
+ * used to describe (apply the strict checker at authorize too, once the stored
+ * rows had been verified clean) has landed.
+ *
+ * WHAT IS LEFT OF IT, EXACTLY — because under the default configuration it is
+ * now very nearly a subset of the other, and a future cleanup will want to
+ * know what would actually be lost by deleting it. Its scheme rule is
+ * subsumed: `isAllowedRedirectUri` already refuses plain http on a
+ * non-loopback host in EVERY environment, so nothing this one refuses on
+ * scheme grounds survives the other. The ONE surviving delta is the RFC 1918
+ * refusal under NODE_ENV=`production`, and it only ever binds when an operator
+ * has put a private-range host into DCR_REDIRECT_URI_ALLOWED_HOSTS: with the
+ * default allowlist the other checker refuses `192.168.x` as host_not_allowed
+ * anyway. That narrow case is the whole reason this function is still called.
  */
 export function validateRedirectUri(
   uri: string,
@@ -74,21 +94,36 @@ export function validateRedirectUri(
       return false;
     }
 
-    // For production, only allow HTTPS
+    // Bracket-stripped so the IPv6 literal `[::1]` compares against `::1`, and
+    // matched EXACTLY via the shared set below — `localhost.evil.com` and
+    // `evil.localhost` both carry a loopback label and neither is the loopback
+    // interface.
+    const hostname = parsedUri.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const isLoopback = LOOPBACK_HOSTNAMES.has(hostname);
+
+    // Production requires HTTPS. Loopback is exempt from that requirement,
+    // and the exemption itself is unconditional — it holds in every
+    // environment, because it is a property of the host and not of NODE_ENV.
+    //
+    // RFC 8252 §7.3 has a native app receive its authorization code on
+    // `http://127.0.0.1:<ephemeral>`: plain http, on a port the OS assigns at
+    // runtime, because an installed client has no other loopback shape
+    // available to it. Refusing that hardens nothing reachable from the
+    // network — the loopback interface is not routable off-box — it only
+    // removes the sole redirect such a client can offer.
     if (
       process.env.NODE_ENV === "production" &&
+      !isLoopback &&
       parsedUri.protocol !== "https:"
     ) {
       return false;
     }
 
-    // Prevent localhost/private IPs in production
+    // Prevent private IPs in production. The loopback addresses are absent by
+    // design and not by omission: none of them falls in a private range, and
+    // unlike `192.168.1.5` they are not reachable by anything else on the LAN.
     if (process.env.NODE_ENV === "production") {
-      const hostname = parsedUri.hostname.toLowerCase();
       if (
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname === "::1" ||
         hostname.startsWith("192.168.") ||
         hostname.startsWith("10.") ||
         hostname.startsWith("172.")
@@ -97,15 +132,218 @@ export function validateRedirectUri(
       }
     }
 
-    // Check against allowed hosts if provided
+    // Check against allowed hosts if provided.
+    //
+    // Both sides are normalised the same way the loopback test above is, and
+    // for the same reason: a raw comparison silently failed whenever the two
+    // spellings differed, so `["::1"]` never matched `http://[::1]/` (the
+    // parser reports the host bracketed) and `["EXAMPLE.COM"]` never matched
+    // anything at all. Entries are bracket-stripped as well as trimmed and
+    // lowercased, so an operator may write an IPv6 host either way.
+    //
+    // An EMPTY array still means "no restriction", unlike
+    // `resolveDcrAllowedHosts`, where empty is a configured "loopback only".
+    // The two disagree because they are reached differently: this parameter is
+    // an optional narrowing a caller opts into, and no caller passes it today.
     if (allowedHosts && allowedHosts.length > 0) {
-      return allowedHosts.includes(parsedUri.hostname);
+      const normalisedAllowedHosts = allowedHosts.map((host) =>
+        host
+          .trim()
+          .toLowerCase()
+          .replace(/^\[|\]$/g, ""),
+      );
+      return normalisedAllowedHosts.includes(hostname);
     }
 
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * The port `apps/backend/src/index.ts` calls `app.listen()` on.
+ *
+ * Needed here because it is the one loopback port a redirect_uri must NOT use:
+ * every request reaches this router through the Next.js rewrite, so
+ * `localhost:12009` is the gateway talking to itself. No external OAuth client
+ * has a callback listener there, which makes `http://localhost:12009/...` a
+ * pure attack shape — the security review run registered exactly that. Kept in step
+ * with index.ts by `redirect-uri-allowlist.test.ts`, which reads the literal
+ * back out of that file; a bare duplicated number would drift silently.
+ */
+export const GATEWAY_INTERNAL_PORT = 12009;
+
+/**
+ * Hostnames a NON-loopback redirect_uri may use at registration time.
+ *
+ * Locked to the Anthropic connector hosts because that is what the live data
+ * says is real: of the 65 clients registered against this gateway before
+ * 2026-08-14, every legitimate redirect_uri was loopback or one of these, and
+ * every other host (evil.com, `your-gateway.example.com.evil.com`,
+ * `…@evil.com`) was a security review probe. An allowlist is therefore the cheapest
+ * complete fix: DCR is anonymous, so anything short of "the
+ * server decides which hosts are acceptable" leaves an attacker free to
+ * register a client whose consent screen shows a plausible name and whose code
+ * lands on their own host.
+ *
+ * `anthropic.com` is included as headroom for a first-party callback move; it
+ * is not currently used by any registered client.
+ */
+export const DEFAULT_DCR_REDIRECT_URI_ALLOWED_HOSTS: readonly string[] = [
+  "claude.ai",
+  "claude.com",
+  "anthropic.com",
+];
+
+/**
+ * Env override for the allowlist above: comma-separated hostnames.
+ *
+ * Setting it REPLACES the default rather than extending it, so an operator can
+ * both add a host and remove one of ours without editing code. Setting it to
+ * an empty value is meaningful, not a mistake — it means "loopback only".
+ */
+export const DCR_REDIRECT_URI_ALLOWED_HOSTS_ENV =
+  "DCR_REDIRECT_URI_ALLOWED_HOSTS";
+
+/**
+ * Exactly the hostnames that count as loopback. Membership is EXACT, never a
+ * suffix test: `localhost.evil.com` and `127.0.0.1.evil.com` both end in a
+ * loopback label and both resolve to an attacker's server.
+ *
+ * `::1` is stored unbracketed because the WHATWG parser reports IPv6 hosts
+ * bracketed (`new URL("http://[::1]/").hostname === "[::1]"`), and the check
+ * strips the brackets before comparing.
+ */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set([
+  "localhost",
+  "127.0.0.1",
+  "::1",
+]);
+
+/** Why a redirect_uri was refused. Machine-readable so tests can pin the rule. */
+export type RedirectUriRejectionReason =
+  | "not_a_string"
+  | "unparseable"
+  | "unsupported_scheme"
+  | "insecure_scheme_non_loopback"
+  | "userinfo_present"
+  | "fragment_present"
+  | "gateway_internal_port"
+  | "host_not_allowed";
+
+export type RedirectUriCheck =
+  | { ok: true }
+  | { ok: false; reason: RedirectUriRejectionReason };
+
+/**
+ * Resolve the effective non-loopback host allowlist.
+ *
+ * Read per call, not at module load, because the env is process configuration
+ * an operator may set at deploy time and because a module-load snapshot cannot
+ * be exercised by more than one test in a file.
+ */
+export function resolveDcrAllowedHosts(): string[] {
+  const raw = process.env[DCR_REDIRECT_URI_ALLOWED_HOSTS_ENV];
+
+  // `undefined` means "not configured" → default. An empty or whitespace-only
+  // string is a configured value meaning "no non-loopback host is allowed".
+  if (raw === undefined) {
+    return [...DEFAULT_DCR_REDIRECT_URI_ALLOWED_HOSTS];
+  }
+
+  return raw
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter((host) => host.length > 0);
+}
+
+/**
+ * The registration-time redirect_uri gate — a HIGH-severity security review
+ * finding: redirect_uri was validated by scheme only.
+ *
+ * `POST /oauth/register` takes no credential, so whatever passes this function
+ * is a host a signed-in human can later be asked to approve on the consent
+ * screen. Before it existed the endpoint 201-accepted `https://evil.com`, the
+ * lookalike `https://your-gateway.example.com.evil.com`, and the userinfo trick
+ * `https://your-gateway.example.com@evil.com` (whose real host is evil.com but
+ * which reads as ours to a human skimming the URL). Only `javascript:`/`data:`
+ * were refused.
+ *
+ * Pure and I/O-free: the only ambient input is the env allowlist, which
+ * `options.allowedHosts` overrides for tests and for callers that have already
+ * resolved it.
+ *
+ * Rules, all of which must pass:
+ *  1. Parses under the WHATWG URL parser.
+ *  2. `https` for non-loopback; `http` only for loopback. Every other scheme
+ *     is refused, which generalises the old `javascript:`/`data:` special case.
+ *  3. No userinfo — `username` and `password` must both be empty.
+ *  4. No fragment (RFC 6749 §3.1.2 forbids one on a redirection endpoint).
+ *  5. Loopback is an EXACT hostname match, any port except the gateway's own
+ *     internal listener.
+ *  6. Non-loopback hosts must match the allowlist exactly. Exact, not suffix:
+ *     a suffix rule is what makes `your-gateway.example.com.evil.com` look
+ *     legitimate, and it would also hand every `*.claude.ai` subdomain — user
+ *     content included — a valid callback.
+ */
+export function isAllowedRedirectUri(
+  uri: unknown,
+  options?: { allowedHosts?: readonly string[] },
+): RedirectUriCheck {
+  if (typeof uri !== "string") {
+    return { ok: false, reason: "not_a_string" };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return { ok: false, reason: "unparseable" };
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return { ok: false, reason: "unsupported_scheme" };
+  }
+
+  // Checked before the host rules on purpose. `https://good.example@evil.com`
+  // has host evil.com, so the allowlist would refuse it anyway — but a URI
+  // whose authority a human and a parser read differently is not something to
+  // accept even when the host happens to be allowed
+  // (`https://evil.com@claude.ai` is the mirror image).
+  if (parsed.username !== "" || parsed.password !== "") {
+    return { ok: false, reason: "userinfo_present" };
+  }
+
+  if (parsed.hash !== "") {
+    return { ok: false, reason: "fragment_present" };
+  }
+
+  // Bracket-stripped so the IPv6 literal `[::1]` compares against `::1`.
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+
+  if (LOOPBACK_HOSTNAMES.has(hostname)) {
+    // Any port a local client happens to bind is fine — an installed client
+    // picks an ephemeral one — except the gateway's own.
+    if (parsed.port === String(GATEWAY_INTERNAL_PORT)) {
+      return { ok: false, reason: "gateway_internal_port" };
+    }
+    return { ok: true };
+  }
+
+  if (parsed.protocol !== "https:") {
+    return { ok: false, reason: "insecure_scheme_non_loopback" };
+  }
+
+  const allowedHosts = (options?.allowedHosts ?? resolveDcrAllowedHosts()).map(
+    (host) => host.trim().toLowerCase(),
+  );
+
+  if (!allowedHosts.includes(hostname)) {
+    return { ok: false, reason: "host_not_allowed" };
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -180,6 +418,47 @@ export function getBaseUrl(req: express.Request): string {
 }
 
 /**
+ * Path prefixes the OAuth router actually serves, matched whole-segment so
+ * `/oauthsomething` is not mistaken for one of ours.
+ *
+ * Lives here rather than in ./index.ts because TWO files need the same answer
+ * and a second copy would drift: the router uses it to scope its anonymous
+ * CORS policy, and `apps/backend/src/index.ts` uses it to steer these paths
+ * away from the global 50mb body parser (see OAUTH_BODY_LIMIT).
+ */
+export const OAUTH_SERVED_PREFIXES = ["/oauth", "/.well-known"] as const;
+
+/** Whole-segment prefix test for the paths above. */
+export function isOAuthServedPath(path: string): boolean {
+  return OAUTH_SERVED_PREFIXES.some(
+    (prefix) => path === prefix || path.startsWith(`${prefix}/`),
+  );
+}
+
+/**
+ * Body-size ceiling for every `/oauth/*` POST.
+ *
+ * These routes used to ride the app-wide `express.json({ limit: "50mb" })`
+ * registered ahead of the router in `apps/backend/src/index.ts`: because that
+ * parser had already consumed and parsed the stream, the 10mb limit written
+ * here never bound anything. So the largest single anonymous write this
+ * gateway accepted was 50mb, on `/oauth/register`, which needs no credential
+ * and stores what it is given.
+ *
+ * 256kb is chosen against the real bodies: a DCR registration under the caps in
+ * ./client-registration.ts is a few kilobytes at worst, a token exchange and a
+ * consent decision are a few hundred bytes. It is roughly two orders of
+ * magnitude of headroom over the largest legitimate request and roughly two
+ * hundred times smaller than what an anonymous caller could previously send.
+ *
+ * The parser must stay AHEAD of the rate limiters on these routes (it is
+ * router-level middleware, they are per-route), so an oversized body is
+ * refused with a 413 by the parser rather than being read in full and then
+ * counted.
+ */
+export const OAUTH_BODY_LIMIT = "256kb";
+
+/**
  * Middleware to add JSON parsing for OAuth POST endpoints
  */
 export function jsonParsingMiddleware(
@@ -194,7 +473,7 @@ export function jsonParsingMiddleware(
 
   if (needsJsonParsing) {
     return express.json({
-      limit: "10mb",
+      limit: OAUTH_BODY_LIMIT,
       type: "application/json",
     })(req, res, next);
   }
@@ -217,7 +496,7 @@ export function urlencodedParsingMiddleware(
   if (needsUrlencodedParsing) {
     return express.urlencoded({
       extended: true,
-      limit: "10mb",
+      limit: OAUTH_BODY_LIMIT,
     })(req, res, next);
   }
   next();
@@ -263,6 +542,10 @@ class RateLimiter {
     this.attempts.delete(identifier);
   }
 
+  clear(): void {
+    this.attempts.clear();
+  }
+
   // Clean up old entries periodically
   cleanup(): void {
     const now = Date.now();
@@ -277,15 +560,47 @@ class RateLimiter {
 // Create rate limiter instances
 const authEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 attempts per 1 minute
 const tokenEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 10 attempts per 1 minute
+const consentDecisionLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 decisions per user per 1 minute
+const registrationEndpointLimiter = new RateLimiter(30, 1 * 60 * 1000); // 30 registrations per caller IP per 1 minute
 
 // Clean up rate limiter entries every 10 minutes
 setInterval(
   () => {
     authEndpointLimiter.cleanup();
     tokenEndpointLimiter.cleanup();
+    consentDecisionLimiter.cleanup();
+    registrationEndpointLimiter.cleanup();
   },
   10 * 60 * 1000,
 );
+
+/**
+ * Rate limit the OAuth consent decision by USER, not by IP.
+ *
+ * The other two limiters key on `req.ip`, which works only as well as the
+ * deployment lets it: express has no `trust proxy` set here and the backend is
+ * reached through the frontend's rewrite inside the same container, so `req.ip`
+ * is the same container-local address for every human. An IP key on this
+ * endpoint would therefore be one bucket shared by the whole organisation —
+ * and unlike the others, a 429 here strands a user who has ALREADY clicked
+ * Approve, with no way forward but to restart the whole flow.
+ *
+ * The user id comes from the verified areq token, so it is this server's own
+ * signed value, not anything the caller asserted.
+ */
+export function isConsentDecisionRateLimited(userId: string): boolean {
+  return consentDecisionLimiter.isRateLimited(`user:${userId}`);
+}
+
+/**
+ * Test-only. The limiter lives at module scope, so without this every consent
+ * test in a file shares one 20-per-minute budget and the suite starts failing
+ * once it grows — as a 429, which looks like a passing negative assertion.
+ * Production never calls this.
+ */
+export function resetConsentDecisionRateLimitForTests(): void {
+  consentDecisionLimiter.clear();
+}
 
 /**
  * Rate limiting middleware for OAuth authorization endpoint
@@ -332,6 +647,69 @@ export function rateLimitToken(
   }
 
   next();
+}
+
+/**
+ * Rate limiting middleware for the RFC 7591 dynamic-registration endpoint.
+ *
+ * WHY /oauth/register CANNOT SHARE /oauth/token's BUCKET. It did, and that was
+ * a denial-of-service against pairing rather than a control on it: both routes
+ * carried `rateLimitToken`, which keys on `req.ip`, and `trust proxy` is
+ * deliberately off (see audit-context.middleware), so every caller through the
+ * tunnel lands in ONE bucket. 20 anonymous registrations in a minute therefore
+ * spent the budget that legitimate claude.ai token exchanges needed, and the
+ * connector's exchange came back 429. The endpoint an attacker can reach for
+ * free must not be able to close the endpoint a paired client depends on.
+ *
+ * KEYED ON CF-Connecting-IP, not `req.ip`. Cloudflare overwrites that header at
+ * the edge on every request, so it is per-CALLER instead of per-container, and
+ * this limiter finally bounds what it is named for. The trust assumption is
+ * exactly the one audit-context.middleware documents at length: it holds only
+ * while the Cloudflare Tunnel is the sole ingress. `req.ip` remains the
+ * fallback for direct-to-origin and local development, where it degrades to
+ * the single shared bucket this endpoint had before.
+ *
+ * THE RESIDUAL, PLAINLY: per-IP keying means the ceiling is per source
+ * address, not global, so a distributed caller is not bounded by this at all.
+ * That is deliberate. What bounds the damage of registration flooding is the
+ * pair of changes it ships with — the input caps in ./client-registration.ts
+ * (how big a row can be) and the retention sweep in ./client-retention.ts (how
+ * long a never-used row survives) — and unlike a global ceiling, neither of
+ * them can refuse a real connector trying to pair.
+ */
+export function rateLimitRegistration(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  const identifier =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
+
+  if (registrationEndpointLimiter.isRateLimited(`register:${identifier}`)) {
+    logger.info(
+      `[RATE LIMIT] Registration endpoint rate limited for IP: ${identifier} - Too many registration attempts`,
+    );
+    return res.status(429).json({
+      error: "too_many_requests",
+      error_description:
+        "Too many registration attempts. Please try again later.",
+    });
+  }
+
+  next();
+}
+
+/**
+ * Test-only, same rationale as resetConsentDecisionRateLimitForTests: the
+ * limiter lives at module scope, so without this one file's registration tests
+ * spend another file's budget and the failure shows up as a 429 that a
+ * negative assertion happily accepts. Production never calls this.
+ */
+export function resetRegistrationRateLimitForTests(): void {
+  registrationEndpointLimiter.clear();
 }
 
 /**

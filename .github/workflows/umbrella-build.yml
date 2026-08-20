@@ -3,7 +3,7 @@ name: Umbrella — Build & Push (umbrella branch)
 # Umbrella IT Group fork — see UMBRELLA_FORK.md.
 # Builds and publishes the deployable line on every push to `umbrella`.
 # Image lands at ghcr.io/umbrella-it-group/metamcp:<sha> + :latest.
-# Watchtower on mcp-host-prod (scope=umbrella) picks up :latest within ~5 min.
+# Watchtower on the deploy host (scope=umbrella) picks up :latest within ~5 min.
 #
 # Also runs build-only (no login, no push, no tags) on PRs targeting
 # `umbrella` — this is the only build check a PR gets before merge. Until
@@ -26,6 +26,11 @@ on:
       - "packages/**"
       - "Dockerfile"
       - "docker-entrypoint.sh"
+      # The entrypoint shells out to scripts/, and the Dockerfile COPYs the
+      # whole directory, so a change confined to a script feeds the image
+      # like any source change. Omitted, it would leave the published image
+      # running the previous version of a script with nothing to say so.
+      - "scripts/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -40,6 +45,11 @@ on:
       - "packages/**"
       - "Dockerfile"
       - "docker-entrypoint.sh"
+      # The entrypoint shells out to scripts/, and the Dockerfile COPYs the
+      # whole directory, so a change confined to a script feeds the image
+      # like any source change. Omitted, it would leave the published image
+      # running the previous version of a script with nothing to say so.
+      - "scripts/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -74,9 +84,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # NOTE: lint + check-types are intentionally not gated here. Upstream
-  # `main` has pre-existing eslint warnings under `--max-warnings 0` and
-  # a tRPC type error in apps/frontend/lib/trpc.ts that aren't caused by
+  # NOTE: this workflow builds the image and nothing else. Tests and
+  # check-types run in umbrella-ci.yml, on the same push/PR-to-`umbrella`
+  # triggers — the frontend tRPC type error this note used to cite is gone,
+  # so check-types is green and gated there. `lint` is still deliberately
+  # ungated anywhere: upstream `main` carries pre-existing eslint warnings
+  # that `--max-warnings 0` turns into a failure, and they aren't caused by
   # our cherry-picks. Upstream itself only runs docker-publish on tags so
   # these never get noticed there. Tracked as a follow-up — see
   # UMBRELLA_FORK.md "Our own patches" backlog.
@@ -122,7 +135,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          # mcp-host-prod is amd64-only; arm64 cross-build doubles CI time
+          # The deploy host is amd64-only; arm64 cross-build doubles CI time
           # for an artifact nothing consumes. Re-add if we ever publish for
           # a community arm64 host.
           platforms: linux/amd64

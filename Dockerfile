@@ -99,9 +99,13 @@ COPY --from=builder --chown=nextjs:nodejs /app/packages ./packages
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
+# Lockfile is required here so the prod install below can run --frozen-lockfile:
+# pin prod deps to the already-resolved graph instead of re-resolving
+# package.json ranges (which can silently drift from the committed lockfile).
+COPY --from=builder --chown=nextjs:nodejs /app/pnpm-lock.yaml ./
 
 # Install production dependencies only
-RUN pnpm install --prod
+RUN pnpm install --prod --frozen-lockfile
 
 # Install drizzle-kit locally in backend for migrations
 RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
@@ -109,6 +113,12 @@ RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh
+
+# Helper scripts the entrypoint shells out to. Separate files rather than more
+# functions inside docker-entrypoint.sh so the same artifact the image runs is
+# the one the test suite executes against a real Postgres.
+COPY --chown=nextjs:nodejs scripts ./scripts
+RUN chmod +x scripts/*.sh
 
 USER nextjs
 

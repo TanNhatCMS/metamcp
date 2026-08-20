@@ -1,6 +1,8 @@
 import express from "express";
 
-import { auth } from "./auth";
+import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
+import { authApiCorsMiddleware } from "./lib/cors-policy";
+import { globalBodyParser } from "./lib/global-body-parser";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
@@ -8,6 +10,10 @@ import {
 } from "./lib/health-upstream";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
+import { auditContextMiddleware } from "./middleware/audit-context.middleware";
+import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
+import { errorHandler } from "./middleware/error-handler.middleware";
+import { authApiRelay } from "./routers/auth-relay";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
@@ -17,69 +23,53 @@ import logger from "./utils/logger";
 
 const app = express();
 
-// Global JSON middleware for non-proxy routes
-app.use((req, res, next) => {
-  if (req.path.startsWith("/mcp-proxy/") || req.path.startsWith("/metamcp/")) {
-    // Skip JSON parsing for all MCP proxy routes and public endpoints to allow raw stream access
-    next();
-  } else {
-    express.json({ limit: "50mb" })(req, res, next);
-  }
-});
+// FIRST registration in this file, and it has to stay first — the mirror of
+// the errorHandler's "has to stay last" at the bottom. Every audit row's
+// `request_id` and `actor_ip` come from here, so any route mounted above it
+// would emit rows with neither. It sits ahead of the body parser too, so the
+// raw-stream `/mcp-proxy` and `/metamcp` legs (which deliberately skip JSON
+// parsing) are covered as well: those are the MCP data plane, i.e. exactly
+// the paths the 2026-08-13 attacker's stolen credential would have been used
+// on. See ./middleware/audit-context.middleware for the CF-Connecting-IP
+// trust assumption and for why `trust proxy` is deliberately NOT set with it.
+app.use(auditContextMiddleware);
+
+// Global JSON middleware for non-proxy routes.
+//
+// The branches live in ./lib/global-body-parser rather than inline here for
+// one reason: this file calls `app.listen()` at module scope and so cannot be
+// imported by a test. Inline, the only available coverage was a test that
+// hand-copied these branches into a model app — which stayed green when the
+// real ones were deleted. See that module's header for what each lane does and
+// why the OAuth skip is what makes the 256kb router limit bind at all.
+app.use(globalBodyParser);
 
 // Mount OAuth metadata endpoints at root level for .well-known discovery
 app.use(oauthRouter);
 
-// Mount better-auth routes by calling auth API directly
-app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api/auth")) {
-    try {
-      // Create a web Request object from Express request
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      const headers = new Headers();
+// `/api/auth` answers with the session cookie and with session contents, so it
+// gets a CORS policy chosen here rather than whatever an earlier-mounted router
+// leaves behind — which is what it had. An allowlisted origin is echoed back
+// specifically; every other origin gets no `Access-Control-Allow-Origin` at
+// all. Never `*` and never a blind reflection of the caller's `Origin`: either
+// one turns a cookie-authenticated response into a cross-site read. The
+// allowlist and the reasoning live in ./lib/cors-policy.
+app.use(authApiCorsMiddleware);
 
-      // Copy headers from Express request
-      Object.entries(req.headers).forEach(([key, value]) => {
-        if (value) {
-          headers.set(key, Array.isArray(value) ? value[0] : value);
-        }
-      });
+// Per-caller cap on password sign-in attempts. AFTER the CORS policy above, so
+// a 429 carries the headers a browser needs to surface it as a 429 rather than
+// as an opaque network failure, and BEFORE the relay, because a request refused
+// after `auth.handler` has run has already spent the password check and written
+// the append-only `auth.login.failure` row this limiter exists to bound. It
+// answers only `POST /api/auth/sign-in/email`; everything else on this surface
+// — SSO, callbacks, session reads, sign-out, dynamic client registration —
+// passes straight through. See ./middleware/auth-signin-rate-limit.middleware.
+app.use(authSigninRateLimitMiddleware);
 
-      // Create Request object
-      const request = new Request(url.toString(), {
-        method: req.method,
-        headers,
-        body:
-          req.method !== "GET" && req.method !== "HEAD"
-            ? JSON.stringify(req.body)
-            : undefined,
-      });
-
-      // Call better-auth directly
-      const response = await auth.handler(request);
-
-      // Convert Response back to Express response
-      res.status(response.status);
-
-      // Copy headers
-      response.headers.forEach((value, key) => {
-        res.setHeader(key, value);
-      });
-
-      // Send body
-      const body = await response.text();
-      res.send(body);
-    } catch (error) {
-      logger.error("Auth route error:", error);
-      res.status(500).json({
-        error: "Internal server error",
-        details: error instanceof Error ? error.message : String(error),
-      });
-    }
-    return;
-  }
-  next();
-});
+// Mount better-auth routes by calling auth API directly. The relay body lives
+// in ./routers/auth-relay so it can be imported by a test — this file cannot,
+// because it calls `app.listen()` at module scope.
+app.use(authApiRelay);
 
 // Umbrella fork: M365 delegated-token broker enrollment routes
 // (better-auth session-gated; boots cleanly when the broker env is
@@ -96,6 +86,16 @@ app.use("/mcp-proxy", mcpProxyRouter);
 app.use("/trpc", trpcRouter);
 
 async function start(): Promise<void> {
+  // FIRST, so the privilege the gateway is actually holding is the first thing
+  // in the boot log rather than something an operator has to go and prove by
+  // hand. Never fatal: a failed check must not turn a privilege question into
+  // an outage, but it is always logged — see ./db/runtime-role-check.
+  try {
+    await verifyRuntimeDatabaseRole();
+  } catch (err) {
+    logger.error("Runtime DB role check failed (continuing):", err);
+  }
+
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 
@@ -168,7 +168,7 @@ const gracefulShutdown = async (signal: string) => {
     const { metaMcpServerPool } = await import(
       "./lib/metamcp/metamcp-server-pool"
     );
-    // Track A4 (METAMCP-POOL-1): clear the public-session idle-TTL
+    // Part of the pool-cap work: clear the public-session idle-TTL
     // sweeper's timer on shutdown, same dispose discipline as PR #70's
     // tools sweep (`toolsSweepTimer` cleared in `mcp-server-pool.ts`'s
     // `cleanupAll`) — a sync call, no need for the Promise.allSettled
@@ -310,3 +310,15 @@ app.get("/health/upstream", async (req, res) => {
     res.status(500).json(buildUpstreamHealthErrorBody());
   }
 });
+
+// LAST registration in this file, and it has to stay last. Express dispatches
+// error middleware in registration order, so one mounted above a router never
+// sees that router's errors — and `app.listen()` runs inside `start()` after
+// an `await`, so every `app.use`/`app.get` at module scope (including this
+// one) is registered before the first request can arrive.
+//
+// Until this existed, a malformed JSON body was answered by Express's built-in
+// final handler with a full stack trace: `/app/...` paths, the pnpm store
+// layout with dependency names and versions, node internals — to an
+// unauthenticated caller. See ./middleware/error-handler.middleware.
+app.use(errorHandler);

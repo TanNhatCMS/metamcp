@@ -7,8 +7,16 @@ export {
   router,
   baseProcedure,
   createTRPCRouter,
+  auditActor,
+  setTrpcAuditSink,
 } from "./trpc";
-export type { BaseContext } from "./trpc";
+export type {
+  AuditActor,
+  AuditRequestContext,
+  BaseContext,
+  TrpcAuditSink,
+  TrpcDenialEvent,
+} from "./trpc";
 
 // Export router creators
 export { createAppRouter, createFrontendRouter } from "./router";
@@ -18,12 +26,16 @@ export { createMcpServersRouter } from "./routers/frontend";
 // same pattern the pre-existing createMcpServersRouter export enables,
 // rather than re-deriving each gate against a synthetic router.
 export {
+  createAccessGroupsRouter,
+  createApiKeysRouter,
   createNamespacesRouter,
   createConfigRouter,
   createToolsRouter,
   createLogsRouter,
   createOAuthRouter,
   createOAuthClientsRouter,
+  createOAuthTokensRouter,
+  createUsersRouter,
 } from "./routers/frontend";
 
 // Export all zod types for convenience

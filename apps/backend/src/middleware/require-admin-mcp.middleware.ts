@@ -12,12 +12,17 @@ type AuthenticatedRequest = express.Request & {
  *
  * Why the whole surface, not just one route: `/mcp-proxy/*` is the MCP
  * Inspector, an operator dev tool that proxies a browser session straight at
- * an arbitrary MCP transport. Its STDIO branch reads `command`, `args` and
- * `env` from the QUERY STRING and hands them to `spawn()` with the backend's
- * full `process.env` (`routers/mcp-proxy/server.ts` `createTransport` ->
- * `ProcessManagedStdioTransport.start`), so being able to reach this router
- * at all is arbitrary command execution on the gateway host as the gateway
- * user. Until this gate the only check was `betterAuthMcpMiddleware`, which
+ * an MCP transport. Its STDIO branch hands a command to `spawn()` with the
+ * backend's full `process.env` (`routers/mcp-proxy/server.ts`
+ * `createTransport` -> `ProcessManagedStdioTransport.start`), so being able to
+ * reach this router at all starts processes on the gateway host as the gateway
+ * user. That command used to be read from the QUERY STRING, which made it
+ * arbitrary command execution; it now comes from the `mcp_servers` row only
+ * (`findRegisteredStdioServer`), so what is reachable here is "start any
+ * REGISTERED server" rather than "run anything". This gate is still what
+ * decides who may do that, and it is not the sourcing fix's backstop nor the
+ * other way round. Until this gate the only check was
+ * `betterAuthMcpMiddleware`, which
  * proves a valid session and nothing else — every member-role account could
  * run commands on the gateway. Gating route-by-route would leave the next
  * route added to this router unprotected, so the gate sits at the parent
@@ -38,6 +43,12 @@ type AuthenticatedRequest = express.Request & {
  * Fail-closed by construction: the test is positive (`role === "admin"`
  * passes), so a missing user, a missing role, an unknown role, or any future
  * change to the session payload shape all land on 403 rather than on access.
+ *
+ * Second consumer, so "the ENTIRE `/mcp-proxy` surface" above is now where
+ * this gate started rather than everywhere it runs: the two operator routes
+ * in `routers/public-metamcp/admin.ts` (`reset-errors`, `error-status`) apply
+ * it per route, because their router shares a mount with the API-key data
+ * plane that must never be asked for a session cookie.
  */
 export const requireAdminMcpMiddleware = (
   req: express.Request,
@@ -51,13 +62,34 @@ export const requireAdminMcpMiddleware = (
       `MCP proxy admin gate denied ${req.method} ${req.path} for user ` +
         `${user?.id ?? "unknown"} (role: ${user?.role ?? "unknown"})`,
     );
-    return res.status(403).json({
-      error: "Forbidden",
-      message:
-        "The MCP Inspector proxy is restricted to administrators. " +
-        "Ask a gateway administrator if you need access.",
-    });
+    return res.status(403).json(buildMcpProxyForbiddenBody());
   }
 
   return next();
 };
+
+/**
+ * The one denial body for the whole `/mcp-proxy` surface.
+ *
+ * Exported because the disabled-account gate
+ * (`require-enabled-mcp.middleware.ts`) answers with it too: both refusals
+ * are 403 with this exact body, so a caller cannot tell "not an admin" from
+ * "an admin who has been locked out". The distinguishing detail is logged at
+ * each gate, where the operator reads it and the caller does not — the same
+ * rule the OAuth token planes follow. Sharing one builder rather than
+ * copying the literal is what keeps the two indistinguishable through later
+ * edits.
+ *
+ * A function rather than a shared constant, for the reason
+ * `lib/health-upstream.ts` `buildUpstreamHealthErrorBody` gives: express
+ * serialises the returned object directly, and a single shared instance is
+ * an invitation for a later mutation to rewrite an earlier response.
+ */
+export function buildMcpProxyForbiddenBody(): Record<string, string> {
+  return {
+    error: "Forbidden",
+    message:
+      "The MCP Inspector proxy is restricted to administrators. " +
+      "Ask a gateway administrator if you need access.",
+  };
+}

@@ -33,6 +33,32 @@ vi.mock("../db/repositories/api-keys.repo", () => ({
   },
 }));
 
+// Same reason as api-keys.repo above: the middleware imports users.repo at
+// module load for the `users.disabled` data-plane gate (migration 0027), and
+// that import chain reaches db/index too. The pure functions under test here
+// never call it — the gate is exercised in api-key-disabled-account.test.ts.
+vi.mock("../db/repositories/users.repo", () => ({
+  usersRepository: { isDisabled: vi.fn() },
+}));
+
+// Same again for oauth.repo: the middleware now validates a bearer token by
+// reading the token row directly instead of calling its own /oauth/introspect
+// over HTTP, so that repository is on the module-load import chain too.
+vi.mock("../db/repositories/oauth.repo", () => ({
+  oauthRepository: { getAccessToken: vi.fn() },
+}));
+
+// The access-group gate (migration 0033) reaches `access-groups.repo` from
+// `lib/endpoint-access-control`, which puts it on this middleware's module-load
+// import chain and therefore on db/index — same reason oauth.repo is mocked
+// above. Every endpoint in this file has `restricted: false`, so the gate
+// returns before it would ever call this.
+vi.mock("../db/repositories/access-groups.repo", () => ({
+  accessGroupsRepository: {
+    hasEndpointGrant: vi.fn().mockResolvedValue(false),
+  },
+}));
+
 import {
   checkApiKeyAccess,
   resolveActsAsUserId,
@@ -60,6 +86,9 @@ const makeEndpoint = (
   client_max_rate_strategy_key: null,
   enable_oauth: false,
   use_query_param_auth: false,
+  // Access-group gate off (migration 0033 default), so these fixtures keep
+  // asserting pre-0033 behaviour exactly.
+  restricted: false,
   created_at: new Date("2026-07-01T00:00:00Z"),
   updated_at: new Date("2026-07-01T00:00:00Z"),
   user_id: null,

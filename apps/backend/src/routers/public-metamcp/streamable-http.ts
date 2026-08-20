@@ -12,7 +12,13 @@ import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
+import { isAdminHealthRequest } from "../../lib/health-upstream";
 import { runWithM365UserContext } from "../../lib/m365/request-context";
+import {
+  resolveCallerContext,
+  stampCallerContext,
+} from "../../lib/metamcp/caller-context";
+import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
   GATEWAY_BOOT_ID,
@@ -25,85 +31,185 @@ import {
   AuthMethod,
   hashAuthPrincipal,
   principalMatches,
+  resolveSessionIdentity,
 } from "../../lib/metamcp/session-auth";
+import {
+  emitSessionBindingDenial,
+  extractPresentedCredential,
+  type SessionDenialReason,
+} from "../../lib/metamcp/session-binding-denial";
 import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
 } from "../../lib/metamcp/transport-recovery-hydration";
 import {
   bindingMatches,
+  boundSessionMatches,
+  classifyBindingDenial,
+  SessionBinding,
   SessionLifetimeManagerImpl,
 } from "../../lib/session-lifetime-manager";
 import { PublicSessionSweeper } from "./public-session-sweeper";
 
 /**
- * Resolve a session's transport ONLY when the session belongs to the
- * endpoint the request is targeting. The in-memory `sessionManager` is
- * keyed by `Mcp-Session-Id` alone, so a bare `getSession(sessionId)` will
- * happily hand endpoint A's transport to a caller authenticated for
- * endpoint B — the caller then drives A's pooled namespace with a key that
- * was never scoped to it. `/health/sessions` used to publish every live
- * session id, making the id trivially guessable.
- *
- * This is the request-path twin of the cross-namespace replay defense in
- * `recoverPersistedSession` (namespace_uuid + endpoint_name must both
- * match). On a binding mismatch (or a session with no recorded binding) we
- * return `undefined` so the caller falls through to the DB recovery path —
- * which re-checks the SAME predicate against the persisted row and returns
- * `not_found`, yielding a clean 404 that never signals the id is live on
- * another endpoint.
+ * The full binding a request presents: the endpoint it is targeting plus the
+ * identity of the credential `authenticateApiKey` resolved for it. Built once
+ * per guard so the endpoint pair and the identity can never be read from two
+ * different requests.
  */
-export function getBoundSession(
-  sessionId: string,
-  authReq: ApiKeyAuthenticatedRequest,
-): StreamableHTTPServerTransport | undefined {
-  const transport = sessionManager.getSession(sessionId);
-  if (!transport) {
-    return undefined;
-  }
-  const binding = sessionManager.getSessionBinding(sessionId);
-  if (
-    !bindingMatches(binding, {
-      namespaceUuid: authReq.namespaceUuid,
-      endpointName: authReq.endpointName,
-    })
-  ) {
-    logger.warn(
-      `Session ${sessionId} presented on endpoint ${authReq.endpointName} ` +
-        `but is bound to a different endpoint — treating as not found.`,
-    );
-    return undefined;
-  }
-  return transport;
+function requestBinding(authReq: ApiKeyAuthenticatedRequest): SessionBinding {
+  return {
+    namespaceUuid: authReq.namespaceUuid,
+    endpointName: authReq.endpointName,
+    identity: resolveSessionIdentity(authReq),
+  };
 }
 
 /**
- * Endpoint-binding guard for the DELETE leg, extracted as a pure resolver
- * (the teardown twin of `getBoundSession`): only the endpoint that OWNS a
- * session may tear it down. Without it a key scoped to endpoint A could
- * DELETE endpoint B's live session AND its persisted recovery row
- * (`cleanupSession` deletes the row) — a cross-endpoint denial of service.
- * Checks the in-memory binding first; if the session isn't resident,
- * verifies the persisted row's binding (same `bindingMatches` predicate)
- * before allowing the delete. A lookup failure is treated as absent —
- * fail-closed, never delete on unknown state. Every non-deletable case
- * collapses into the ONE `not_found` outcome, so the route's single 404
- * response cannot reveal that the id is live on another endpoint.
+ * Resolve a session's transport ONLY for the endpoint the session belongs to
+ * AND the credential that created it. The in-memory `sessionManager` is keyed
+ * by `Mcp-Session-Id` alone, so a bare `getSession(sessionId)` will happily
+ * hand one caller's transport to another — endpoint A's transport to a key
+ * authenticated for endpoint B, or, on any endpoint reachable by more than one
+ * credential, consumer A's live session to consumer B. `/health/sessions` used
+ * to publish every live session id, making the id trivially guessable.
+ *
+ * This is the request-path twin of the defenses `recoverPersistedSession` has
+ * always applied to the DB row: namespace_uuid + endpoint_name must match, and
+ * the credential must be the one the session was opened with. The in-memory
+ * fast path — which serves every request after the first — checked only the
+ * first half.
+ *
+ * THREE outcomes, and the split between the last two is the load-bearing part:
+ *
+ *  - `ok` — serve it.
+ *  - `absent` — nothing resident under this id. The caller falls through to
+ *    lazy recovery, which may legitimately rebuild the session from
+ *    `mcp_sessions`.
+ *  - `refused` — a session IS resident but is not this caller's. The caller
+ *    answers 404 DIRECTLY and never attempts recovery. Falling through would
+ *    reach `recoverPersistedSession`, whose principal check fails and returns
+ *    `auth_failed` -> 401, which both breaks the spec's re-initialize contract
+ *    (a client is told to fix its credential, not to start a new session) and
+ *    tells the caller that the id it presented is real and belongs to someone
+ *    else. The route funnels `refused` into the same 404 statement as a
+ *    genuine miss, so the response CONTENT cannot distinguish them.
+ *
+ * Content, not timing: `refused` returns from memory while a genuine miss
+ * spends a `mcpSessionsRepository.findById` round trip, so the two remain
+ * separable by latency. That is left open on purpose — closing it would mean
+ * burning a pointless query on every refusal, and the oracle it leaves is
+ * worth nothing against `randomUUID` session ids, which an attacker has to
+ * hold before the timing difference tells them anything.
+ */
+export type BoundSessionResolution =
+  | { outcome: "ok"; transport: StreamableHTTPServerTransport }
+  | { outcome: "absent" }
+  | { outcome: "refused" };
+
+export function resolveBoundSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+): BoundSessionResolution {
+  const transport = sessionManager.getSession(sessionId);
+  if (!transport) {
+    return { outcome: "absent" };
+  }
+  const binding = sessionManager.getSessionBinding(sessionId);
+  const target = requestBinding(authReq);
+  if (!boundSessionMatches(binding, target)) {
+    refuseBoundSession(
+      sessionId,
+      authReq,
+      classifyBindingDenial(binding, target),
+    );
+    return { outcome: "refused" };
+  }
+  return { outcome: "ok", transport };
+}
+
+/**
+ * Record a refused session reuse — one durable audit row and one warn line,
+ * both under the SAME throttle decision.
+ *
+ * The log line is throttled alongside the row rather than written per attempt
+ * for the reason the row is: this is output a REFUSED caller paces, and a warn
+ * per attempt turns an id-enumeration sweep into a log flood that buries the
+ * first line, which is the one worth reading. The suppressed count rides along
+ * so volume survives.
+ *
+ * Every refusal leg funnels through here so the reason recorded and the reason
+ * logged cannot disagree.
+ */
+function refuseBoundSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+  reason: SessionDenialReason,
+): void {
+  const { emitted, suppressed } = emitSessionBindingDenial(authReq, {
+    sessionId,
+    reason,
+  });
+  if (emitted) {
+    logger.warn(
+      `Session ${sessionId} presented on endpoint ${authReq.endpointName} ` +
+        `refused (${reason}) — treating as not found. ` +
+        `${suppressed} similar refusal(s) suppressed since the last line.`,
+    );
+  }
+}
+
+/**
+ * Ownership guard for the DELETE leg, extracted as a pure resolver (the
+ * teardown twin of `resolveBoundSession`): only the endpoint AND the
+ * credential that own a session may tear it down. Without it a key scoped to
+ * endpoint A could DELETE endpoint B's live session AND its persisted recovery
+ * row (`cleanupSession` deletes the row), and any second credential on the
+ * SAME endpoint could do the same to a sibling consumer — a denial of service
+ * that needs nothing but a session id.
+ *
+ * Checks the in-memory binding first through `boundSessionMatches` (endpoint +
+ * creating identity). If the session isn't resident, the persisted row is the
+ * only evidence, so the check is the one that row can support: the endpoint
+ * pair via `bindingMatches`, plus the same `auth_method` + `auth_principal`
+ * comparison `recoverPersistedSession` makes. Verifying the endpoint alone
+ * there would leave the hole open for exactly the sessions the idle sweeper
+ * has already reaped, whose rows survive by design.
+ *
+ * A lookup failure is treated as absent — fail-closed, never delete on unknown
+ * state. Every non-deletable case collapses into the ONE `not_found` outcome,
+ * so the route's single 404 response cannot reveal that the id is live and
+ * owned by someone else.
+ *
+ * THE TWO BRANCHES DEFINE "SAME PRINCIPAL" DIFFERENTLY, and that asymmetry is
+ * accepted rather than accidental. In memory an OAuth session is bound to the
+ * USER id, so a connector that refreshed its 24h access token still owns its
+ * session. The persisted row cannot offer that: `mcp_sessions` stores only
+ * `auth_principal` (a one-way hash of the token) and `auth_method` — there is
+ * no user column to compare, and a user id is not recoverable from a SHA-256
+ * digest. So a rotated OAuth token cannot tear down its own session once the
+ * idle sweeper has reaped it: the DELETE answers 404 and the row survives to
+ * the `MCP_SESSION_TTL_DAYS` pruner. That is the same rule
+ * `recoverPersistedSession` has always applied — token rotation invalidates
+ * the recovery path, by design, so a revoked token cannot survive a restart —
+ * and the cost here is a lingering row plus a 404 on a teardown, never a live
+ * session left reachable by the wrong caller. Widening it would mean storing
+ * the user id alongside the hash, which is a schema change and a new thing to
+ * keep in sync, for a case whose worst outcome is one row aging out.
  */
 export async function resolveDeletableSession(
   sessionId: string,
   authReq: ApiKeyAuthenticatedRequest,
 ): Promise<{ outcome: "deletable" } | { outcome: "not_found" }> {
-  const target = {
-    namespaceUuid: authReq.namespaceUuid,
-    endpointName: authReq.endpointName,
-  };
+  const target = requestBinding(authReq);
   const inMemoryTransport = sessionManager.getSession(sessionId);
   if (inMemoryTransport) {
-    if (!bindingMatches(sessionManager.getSessionBinding(sessionId), target)) {
-      logger.warn(
-        `DELETE for session ${sessionId} on endpoint ${target.endpointName} ` +
-          `rejected — session bound to a different endpoint.`,
+    const binding = sessionManager.getSessionBinding(sessionId);
+    if (!boundSessionMatches(binding, target)) {
+      refuseBoundSession(
+        sessionId,
+        authReq,
+        classifyBindingDenial(binding, target),
       );
       return { outcome: "not_found" };
     }
@@ -132,6 +238,22 @@ export async function resolveDeletableSession(
   ) {
     return { outcome: "not_found" };
   }
+  const rawToken = extractPresentedCredential(authReq, authReq.endpoint);
+  if (
+    !rawToken ||
+    stored.auth_method !== authMethodFromRequest(authReq) ||
+    !principalMatches(
+      hashAuthPrincipal(rawToken, authMethodFromRequest(authReq)),
+      stored.auth_principal,
+    )
+  ) {
+    refuseBoundSession(
+      sessionId,
+      authReq,
+      "session_persisted_credential_mismatch",
+    );
+    return { outcome: "not_found" };
+  }
   return { outcome: "deletable" };
 }
 
@@ -148,8 +270,8 @@ const sessionManager =
 // request IDLE time, not session CREATION age. The age-based timer keys off
 // `configService.getSessionLifetime()`, which is null in prod (persistent
 // sessions never expire) so it never fires — that is exactly why public
-// sessions accumulated to backend-pool exhaustion (2026-07-14 incident,
-// METAMCP-POOL-1). The sweeper reuses `reapIdleSession` (defined below) — a
+// sessions accumulated to backend-pool exhaustion (the 2026-07-14 pool-cap
+// outage). The sweeper reuses `reapIdleSession` (defined below) — a
 // ROW-PRESERVING cleanup variant, NOT the same variant a client DELETE uses
 // (`cleanupSession`, which also drops the `mcp_sessions` row). See
 // `reapIdleSession`'s own doc comment for why that distinction is load-
@@ -214,10 +336,20 @@ export async function dispatchTracked(
   req: express.Request,
   res: express.Response,
   sessionId: string,
+  clientName?: string,
 ): Promise<void> {
   publicSessionSweeper.markInFlight(sessionId);
   try {
-    await handleRequestWithUserContext(authReq, transport, req, res);
+    // Enter the request-scoped caller binding for the whole dispatch, so the
+    // auditing middleware attributes this call to THIS request rather than to
+    // whichever request last stamped the pooled handler context. Every
+    // Streamable-HTTP tool call reaches the transport through here, which is
+    // what makes the store the authoritative source rather than a best-effort
+    // one. See `lib/metamcp/caller-context-store`.
+    await runWithCallerContext(
+      { ...resolveCallerContext(authReq), clientName },
+      () => handleRequestWithUserContext(authReq, transport, req, res),
+    );
   } finally {
     publicSessionSweeper.markSettled(sessionId);
   }
@@ -277,35 +409,6 @@ function authMethodFromRequest(req: ApiKeyAuthenticatedRequest): AuthMethod {
   return req.authMethod === "oauth" ? "oauth" : "api_key";
 }
 
-/**
- * Extract the raw bearer token (or API key) the middleware authenticated
- * from. The middleware doesn't surface the matched token explicitly, so
- * we replay the same header lookup it used. Returns `null` when no
- * recognizable credential is present — the lazy-recovery path then
- * refuses recovery (a credential-less request can't reclaim a session).
- */
-function extractRawTokenForPrincipal(req: express.Request): string | null {
-  const apiKeyHeader = req.headers["x-api-key"];
-  if (typeof apiKeyHeader === "string" && apiKeyHeader.length > 0) {
-    return apiKeyHeader;
-  }
-  const authHeader = req.headers.authorization;
-  if (
-    typeof authHeader === "string" &&
-    authHeader.startsWith("Bearer ") &&
-    authHeader.length > 7
-  ) {
-    return authHeader.substring(7);
-  }
-  const queryToken =
-    (req.query.api_key as string | undefined) ||
-    (req.query.apikey as string | undefined);
-  if (queryToken) {
-    return queryToken;
-  }
-  return null;
-}
-
 // Fail-loud at boot if the SDK internals the recovery hydration depends
 // on changed shape across an upgrade. See transport-recovery-hydration.ts.
 assertRecoveryHydrationContract();
@@ -344,7 +447,7 @@ export async function recoverPersistedSession(
     // DB error during recovery is a hard miss — fall through to the
     // existing 404 path. Logged so post-mortem can correlate with
     // postgres availability events; this is operational noise, not
-    // a security incident.
+    // a security event.
     logger.error(
       `mcp_sessions lookup failed for session ${sessionId}; treating as not-found.`,
       error,
@@ -359,10 +462,11 @@ export async function recoverPersistedSession(
   // be stale-but-not-yet-pruned, and a different consumer with a
   // valid credential for endpoint B should not be able to reclaim
   // a session that was created against endpoint A. Routed through
-  // `bindingMatches` — the SAME predicate `getBoundSession` and
-  // `resolveDeletableSession` use — so the endpoint-binding check
-  // exists exactly once file-wide and cannot drift between the three
-  // legs.
+  // `bindingMatches` — the SAME endpoint predicate `boundSessionMatches`
+  // is built on and `resolveDeletableSession`'s persisted branch uses —
+  // so the endpoint check exists exactly once file-wide and cannot drift
+  // between the legs. The credential half of this path's guard is the
+  // `auth_method` + `auth_principal` comparison further down.
   if (
     !bindingMatches(
       {
@@ -425,7 +529,7 @@ export async function recoverPersistedSession(
     return { status: "not_found" };
   }
 
-  const rawToken = extractRawTokenForPrincipal(authReq);
+  const rawToken = extractPresentedCredential(authReq, authReq.endpoint);
   if (!rawToken) {
     return { status: "auth_failed" };
   }
@@ -456,7 +560,11 @@ export async function recoverPersistedSession(
   // post-restart tool calls stay attributed (the registry/in-memory state is
   // gone after a restart; authReq is the re-validated current caller).
   const recoveredIdentity = await resolveClientIdentity(authReq);
-  mcpServerInstance.handlerContext.clientName = recoveredIdentity?.name;
+  stampCallerContext(
+    mcpServerInstance.handlerContext,
+    authReq,
+    recoveredIdentity?.name,
+  );
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,
     onsessioninitialized: async (sid) => {
@@ -485,14 +593,14 @@ export async function recoverPersistedSession(
       );
     return { status: "not_found" };
   }
-  // Bind the recovered session to its endpoint. The row already passed the
-  // namespace_uuid + endpoint_name match above, so authReq's values are the
-  // session's true binding — record them so subsequent in-memory lookups go
-  // through the same endpoint check as the fresh-session path.
-  sessionManager.addSession(sessionId, transport, {
-    namespaceUuid: authReq.namespaceUuid,
-    endpointName: authReq.endpointName,
-  });
+  // Bind the recovered session to its endpoint and to the caller. The row
+  // already passed the namespace_uuid + endpoint_name match AND the
+  // auth_method + auth_principal comparison above, so this request's endpoint
+  // and identity ARE the session's true binding — record them so subsequent
+  // in-memory lookups go through the same check as the fresh-session path.
+  // Recording the recovering caller's identity is not a rebind: recovery is
+  // only reached with the credential whose hash the row already stores.
+  sessionManager.addSession(sessionId, transport, requestBinding(authReq));
   // Resume idle-TTL tracking for the recovered session. Required whether
   // this recovery followed a sweep reap (the reap's forget() dropped
   // tracking; without this the recovered session would never be
@@ -524,7 +632,7 @@ export async function recoverPersistedSession(
  * its MetaMCP/backend pool connections. `deleteRow` controls whether the
  * persisted `mcp_sessions` row is ALSO dropped — this is the one axis on
  * which the two public wrappers below (`cleanupSession`, `reapIdleSession`)
- * differ, and the distinction is load-bearing (foreman review, PR #72
+ * differ, and the distinction is load-bearing (code review, PR #72
  * fixes round):
  *
  *   - `deleteRow: true` (client DELETE, the age-based `sessionLifetime`
@@ -709,46 +817,88 @@ export function stopMcpSessionPruner(): void {
 
 startMcpSessionPruner();
 
-// Health check endpoint to monitor sessions.
-//
-// This route is UNAUTHENTICATED. It deliberately publishes only aggregate
-// counts + sweeper stats — never the live session ids. An earlier version
-// returned `sessionIds: [...]`, i.e. every consumer's `Mcp-Session-Id`, to
-// any unauthenticated caller. Combined with the session-id-keyed transport
-// lookup on the MCP legs (now endpoint-bound — see `getBoundSession`), that
-// handed an attacker the exact ids needed to attempt a cross-endpoint
-// replay. Monitoring consumes `count` + the `publicSessionSweeper` block
-// (trackedSessions / reap counters); neither needs the ids. If per-session
-// detail is ever required, add a separately auth-gated admin view rather
-// than widening this public payload.
-//
-// The same rule binds `metaMcpPoolStatus`: `getPoolStatus()` returns
-// `activeSessionIds` + `idleNamespaceUuids` alongside the counts, and
-// spreading it whole re-published the very ids the `sessionIds` removal took
-// away, one level down. The counts are projected out field by field here so
-// a field added to MetaMcpServerPoolStatus later cannot land in this payload
-// by default. Admins still get the detail half via `/health/upstream`, which
-// is role-gated; `getPoolStatus` itself is deliberately left intact.
-export function buildSessionsHealthPayload() {
+/**
+ * Assemble the `GET /health/sessions` body. Pass `false` for `isAdmin` to
+ * withhold the operational half.
+ *
+ * The route stays UNAUTHENTICATED and must — external monitors probe it and a
+ * 401 would break them — so what it PUBLISHES is split by role instead. Every
+ * caller gets `status: "ok"`, which is all a liveness probe consumes; the
+ * detail is admin-only.
+ *
+ * That detail is live operational intel about this gateway. The session count
+ * and the pool's idle/active split are its current scale and load; the
+ * `publicSessionSweeper` block publishes the reap TTL, the sweep interval and
+ * the running reap counters — i.e. precisely how long an abandoned session
+ * survives, how often the gateway looks, and how many it is carrying right
+ * now. Together those size a resource-exhaustion attempt against the backend
+ * pool cap (the failure mode of the 2026-07-14 pool-cap outage) and
+ * time it to land between sweeps. Served to anyone who could reach the host,
+ * it was reconnaissance.
+ *
+ * Built additively rather than by deleting keys from a full body, matching
+ * `buildUpstreamHealthBody` in ../../lib/health-upstream: a field added to
+ * the block below cannot leak by someone forgetting to add it to a redaction
+ * list. The early return also means an anonymous request never reads the
+ * session manager, the pool or the sweeper at all.
+ *
+ * The admin half still never carries live session ids. An earlier version
+ * returned `sessionIds: [...]` — every consumer's `Mcp-Session-Id` — and,
+ * after that removal, re-published the same ids one level down by spreading
+ * `getPoolStatus()` whole (it returns `activeSessionIds` +
+ * `idleNamespaceUuids` alongside the counts). Both are projected out field by
+ * field here so a field added to MetaMcpServerPoolStatus later cannot land in
+ * this payload by default; `getPoolStatus` itself is deliberately left
+ * intact.
+ */
+export function buildSessionsHealthPayload(
+  isAdmin: boolean,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    status: "ok",
+  };
+
+  if (!isAdmin) {
+    return body;
+  }
+
   const sessionCount = sessionManager.getSessionCount();
   const poolStatus = metaMcpServerPool.getPoolStatus();
 
-  return {
-    timestamp: new Date().toISOString(),
-    streamableHttpSessions: {
-      count: sessionCount,
-    },
-    metaMcpPoolStatus: {
-      idle: poolStatus.idle,
-      active: poolStatus.active,
-    },
-    totalActiveSessions: sessionCount + poolStatus.active,
-    publicSessionSweeper: publicSessionSweeper.getStats(),
+  body.timestamp = new Date().toISOString();
+  body.streamableHttpSessions = {
+    count: sessionCount,
   };
+  body.metaMcpPoolStatus = {
+    idle: poolStatus.idle,
+    active: poolStatus.active,
+  };
+  body.totalActiveSessions = sessionCount + poolStatus.active;
+  body.publicSessionSweeper = publicSessionSweeper.getStats();
+
+  return body;
 }
 
-streamableHttpRouter.get("/health/sessions", (req, res) => {
-  res.json(buildSessionsHealthPayload());
+streamableHttpRouter.get("/health/sessions", async (req, res) => {
+  // Gated with the same soft admin check as /health/upstream and GET
+  // /metamcp/: it resolves the better-auth session and fails to "not an
+  // admin" on every error path, so it can never 401 or throw on this
+  // unauthenticated route.
+  //
+  // The catch enforces that same invariant one level out. `isAdminHealthRequest`
+  // is contractually non-throwing, but express 4 does not catch an async
+  // handler's rejection — if the gate ever regressed to throwing, the request
+  // would hang with no response at all and take every liveness probe down
+  // with it. Falling back to `false` keeps the 200 and keeps the failure
+  // direction safe: a broken auth check withholds detail, it never exposes it.
+  let isAdmin = false;
+  try {
+    isAdmin = await isAdminHealthRequest(req);
+  } catch (error) {
+    logger.error("Admin check failed for /health/sessions:", error);
+  }
+
+  res.json(buildSessionsHealthPayload(isAdmin));
 });
 
 streamableHttpRouter.get(
@@ -769,27 +919,37 @@ streamableHttpRouter.get(
       logger.info(`Looking up existing session: ${sessionId}`);
 
       const authReq = req as ApiKeyAuthenticatedRequest;
-      // Endpoint-bound lookup: a session id presented on an endpoint other
-      // than the one it was created against resolves to `undefined` here and
-      // falls into recovery, which 404s on the same predicate.
-      let transport = getBoundSession(sessionId, authReq);
-      if (!transport) {
-        logger.info(
-          `Session ${sessionId} not found (or bound to another endpoint) in session manager — attempting lazy recovery from mcp_sessions.`,
-        );
-        const recovery = await recoverPersistedSession(sessionId, authReq);
-        if (recovery.status === "recovered") {
-          transport = recovery.transport;
-        } else if (recovery.status === "auth_failed") {
-          res.status(401).end("Unauthorized");
-          return;
-        } else {
-          // Stale or expired sessionId. Per MCP Streamable HTTP spec the
-          // client MUST start a new session in response to HTTP 404 on a
-          // sessioned request. Surface a header-flag for clients that
-          // honor the contract, and keep the response body minimal
-          // (the previous body dumped the full active-session list into
-          // logs/clients — info leak + not actionable).
+      // Endpoint- and credential-bound lookup. A session id presented on
+      // another endpoint, or under a credential that did not create it, is
+      // `refused` and skips recovery entirely — recovery would answer 401 and
+      // confirm the id belongs to someone else. Both that case and a genuine
+      // miss end at the single 404 below.
+      let transport: StreamableHTTPServerTransport | undefined;
+      const resolved = resolveBoundSession(sessionId, authReq);
+      if (resolved.outcome === "ok") {
+        transport = resolved.transport;
+      } else {
+        if (resolved.outcome === "absent") {
+          logger.info(
+            `Session ${sessionId} not found in session manager — attempting lazy recovery from mcp_sessions.`,
+          );
+          const recovery = await recoverPersistedSession(sessionId, authReq);
+          if (recovery.status === "recovered") {
+            transport = recovery.transport;
+          } else if (recovery.status === "auth_failed") {
+            res.status(401).end("Unauthorized");
+            return;
+          }
+        }
+        if (!transport) {
+          // Stale, expired, or not this caller's sessionId. Per MCP
+          // Streamable HTTP spec the client MUST start a new session in
+          // response to HTTP 404 on a sessioned request. Surface a
+          // header-flag for clients that honor the contract, and keep the
+          // response body minimal (the previous body dumped the full
+          // active-session list into logs/clients — info leak + not
+          // actionable). ONE response statement for every non-servable
+          // case, so a refused reuse is indistinguishable from a miss.
           res
             .status(404)
             .setHeader("Mcp-Session-Reinitialize-Required", "true")
@@ -801,6 +961,10 @@ streamableHttpRouter.get(
         }
       }
       logger.info(`Handling GET for session ${sessionId}`);
+      // No clientName resolved for the standalone GET stream: it carries only
+      // server-initiated notifications, never a tools/call, so nothing on this
+      // leg reaches the auditing middleware. The identity half of the binding
+      // still rides the store via dispatchTracked, which costs no lookup.
       await dispatchTracked(authReq, transport, req, res, sessionId);
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
@@ -851,11 +1015,20 @@ streamableHttpRouter.post(
           throw new Error("Failed to get MetaMCP server instance from pool");
         }
 
-        // Stamp the calling consumer onto the (possibly idle-warmed) instance's
-        // handler context so the audit middleware attributes tool calls to it.
-        // Idle servers carry a placeholder sessionId, so we can't key by
-        // sessionId — we set it directly on the instance we just acquired.
-        mcpServerInstance.handlerContext.clientName = clientIdentity?.name;
+        // Stamp the calling consumer + caller binding onto the (possibly
+        // idle-warmed) instance's handler context. Idle servers carry a
+        // placeholder sessionId, so we can't key by sessionId — we set it
+        // directly on the instance we just acquired.
+        //
+        // This is the FALLBACK carrier (migration 0030). The row an audit
+        // write actually uses comes from the request-scoped store entered in
+        // dispatchTracked; see `lib/metamcp/caller-context-store` for why a
+        // per-instance object cannot be the source of truth.
+        stampCallerContext(
+          mcpServerInstance.handlerContext,
+          authReq,
+          clientIdentity?.name,
+        );
 
         logger.info(
           `Using MetaMCP server instance for public endpoint session ${newSessionId} (endpoint: ${endpointName})`,
@@ -875,6 +1048,13 @@ streamableHttpRouter.post(
                 level: "info",
                 message: "client connected",
                 clientName: clientIdentity?.name,
+                // Carried into `gateway_events.session_id` so the history says
+                // WHICH session a client opened, not merely that one was
+                // opened. Deliberately not described as a join key onto
+                // `tool_call_audit`: that column is filled from
+                // `handlerContext.sessionId`, which on the warm path still
+                // holds the pool's placeholder id for an idle-promoted server.
+                sessionId,
               });
             } catch (error) {
               logger.error(
@@ -893,12 +1073,14 @@ streamableHttpRouter.post(
         );
 
         // Store transport reference, bound to the endpoint it was created
-        // against so a later request carrying this id on a DIFFERENT endpoint
-        // is rejected (see getBoundSession).
-        sessionManager.addSession(newSessionId, transport, {
-          namespaceUuid,
-          endpointName,
-        });
+        // against AND to the credential that created it, so a later request
+        // carrying this id on a different endpoint or under a different
+        // credential is rejected (see resolveBoundSession).
+        sessionManager.addSession(
+          newSessionId,
+          transport,
+          requestBinding(authReq),
+        );
         // Seed idle-TTL tracking for the new session (dispatchTracked's
         // markInFlight/touch calls are guarded to no-op on an untracked
         // session — see their doc comments — so this unconditional seed is
@@ -923,7 +1105,7 @@ streamableHttpRouter.post(
         // recover this consumer's cached sessionId. Best-effort — a DB
         // outage during init shouldn't block the consumer; they'll just
         // lose the post-restart recovery path until the next init.
-        const rawToken = extractRawTokenForPrincipal(req);
+        const rawToken = extractPresentedCredential(req, authReq.endpoint);
         if (rawToken) {
           const authMethod = authMethodFromRequest(authReq);
           const principal = hashAuthPrincipal(rawToken, authMethod);
@@ -951,7 +1133,14 @@ streamableHttpRouter.post(
         }
 
         // Now handle the request - server is guaranteed to be ready
-        await dispatchTracked(authReq, transport, req, res, newSessionId);
+        await dispatchTracked(
+          authReq,
+          transport,
+          req,
+          res,
+          newSessionId,
+          clientIdentity?.name,
+        );
       } catch (error) {
         logger.error("Error in public endpoint /mcp POST route:", error);
 
@@ -975,30 +1164,36 @@ streamableHttpRouter.post(
       try {
         logger.info(`Looking up existing session: ${sessionId}`);
 
-        let transport = getBoundSession(sessionId, authReq);
-        if (!transport) {
-          logger.info(
-            `Transport for sessionId ${sessionId} not in memory (or bound to another endpoint) — attempting lazy recovery from mcp_sessions.`,
-          );
-          const recovery = await recoverPersistedSession(sessionId, authReq);
-          if (recovery.status === "recovered") {
-            transport = recovery.transport;
-            // Bump idempotently so subsequent same-session reads hit the
-            // in-memory map; touch already happened inside recovery.
-          } else if (recovery.status === "auth_failed") {
-            logger.warn(
-              `Lazy recovery refused for session ${sessionId}: auth principal mismatch or missing credential.`,
+        let transport: StreamableHTTPServerTransport | undefined;
+        const resolved = resolveBoundSession(sessionId, authReq);
+        if (resolved.outcome === "ok") {
+          transport = resolved.transport;
+        } else {
+          if (resolved.outcome === "absent") {
+            logger.info(
+              `Transport for sessionId ${sessionId} not in memory — attempting lazy recovery from mcp_sessions.`,
             );
-            res.status(401).json({
-              error: "Unauthorized",
-              message:
-                "Stored auth principal does not match incoming credential.",
-              timestamp: new Date().toISOString(),
-            });
-            return;
-          } else {
+            const recovery = await recoverPersistedSession(sessionId, authReq);
+            if (recovery.status === "recovered") {
+              transport = recovery.transport;
+              // Bump idempotently so subsequent same-session reads hit the
+              // in-memory map; touch already happened inside recovery.
+            } else if (recovery.status === "auth_failed") {
+              logger.warn(
+                `Lazy recovery refused for session ${sessionId}: auth principal mismatch or missing credential.`,
+              );
+              res.status(401).json({
+                error: "Unauthorized",
+                message:
+                  "Stored auth principal does not match incoming credential.",
+                timestamp: new Date().toISOString(),
+              });
+              return;
+            }
+          }
+          if (!transport) {
             logger.error(
-              `Transport not found for sessionId ${sessionId} and no recoverable persisted row.`,
+              `No servable transport for sessionId ${sessionId} — absent, unrecoverable, or bound to another caller.`,
             );
             // Stale or expired sessionId. The prior response embedded
             // `available_sessions: sessionManager.getSessionIds()` —
@@ -1020,6 +1215,10 @@ streamableHttpRouter.post(
             // the client side honors reinit, this is the cleanest
             // server-side signal we can hand it. Task #29 has the
             // full background.
+            //
+            // A session resident under ANOTHER caller lands here too, on
+            // the same statement, so the response says nothing about
+            // which of the two it was.
             res
               .status(404)
               .setHeader("Mcp-Session-Reinitialize-Required", "true")
@@ -1034,8 +1233,43 @@ streamableHttpRouter.post(
             return;
           }
         }
+        // Refresh the pooled instance's fallback binding to THIS request.
+        //
+        // The authoritative binding for the audit row is the request-scoped
+        // store `dispatchTracked` enters below; this keeps the fallback from
+        // describing an older request. It matters because the handler context
+        // is per-INSTANCE while the facts on it are per-REQUEST: `requestId`
+        // and `callerIp` change on every call, and the instance is reached by
+        // an in-memory session lookup that resolves on namespace + endpoint
+        // rather than by re-deriving the caller from the credential presented
+        // now. Neither property makes the pooled object safe to audit from,
+        // which is exactly why the store exists — see
+        // `lib/metamcp/caller-context-store`.
+        //
+        // A pure map read, never a create: an instance the pool no longer
+        // holds means the transport is being served from lazy recovery, which
+        // stamps its own binding. Nothing is keyed on the handler context's
+        // own sessionId here — that is a placeholder on an idle-converted
+        // instance — only on the transport session id the pool itself
+        // assigned.
+        const activeInstance = metaMcpServerPool.getServerInstance(sessionId);
+        if (activeInstance) {
+          stampCallerContext(
+            activeInstance.handlerContext,
+            authReq,
+            clientIdentity?.name,
+          );
+        }
+
         logger.info(`Handling POST for session ${sessionId}`);
-        await dispatchTracked(authReq, transport, req, res, sessionId);
+        await dispatchTracked(
+          authReq,
+          transport,
+          req,
+          res,
+          sessionId,
+          clientIdentity?.name,
+        );
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);
 

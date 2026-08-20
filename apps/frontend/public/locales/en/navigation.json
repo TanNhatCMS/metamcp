@@ -6,6 +6,8 @@
   "mcpInspector": "MCP Inspector",
   "apiKeys": "API Keys",
   "oauthClients": "OAuth Clients",
+  "access": "Access",
+  "accessGroups": "Access Groups",
   "settings": "Settings",
   "liveLogs": "Live Logs",
   "application": "Application",

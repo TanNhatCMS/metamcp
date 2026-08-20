@@ -13,10 +13,19 @@ export const createAppRouter = (implementations: {
       endpoints: frontendRouters.endpoints,
       oauth: frontendRouters.oauth,
       oauthClients: frontendRouters.oauthClients,
+      // Access dashboard. Sub-routers are enumerated
+      // explicitly here, so a router that is not listed is unreachable no
+      // matter how it is wired elsewhere.
+      oauthTokens: frontendRouters.oauthTokens,
+      users: frontendRouters.users,
       tools: frontendRouters.tools,
       apiKeys: frontendRouters.apiKeys,
       config: frontendRouters.config,
       logs: frontendRouters.logs,
+      // Access groups (migration 0033): which OAuth users may reach which
+      // endpoints. Listed here for the reason stated above — wiring the
+      // implementations into `createFrontendRouter` is NOT enough to mount it.
+      accessGroups: frontendRouters.accessGroups,
     }),
   });
 };

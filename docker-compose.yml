@@ -16,26 +16,96 @@ services:
       - "12008:12008"
     environment:
       # Postgres connection details
+      #
+      # POSTGRES_PASSWORD is REQUIRED and deliberately has no fallback. This
+      # file used to default it to a literal published in this repository, so
+      # a deployment that never set the variable came up on a password anyone
+      # who had read the source could look up — and nothing said so. The
+      # `:?` form makes compose refuse to render with the message below
+      # instead, which is a loud stop rather than a quiet weak credential.
+      # The other four Postgres values keep their defaults — a host, a port, a
+      # role name and a database name are not secrets.
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m3t4mcp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
 
       # Database configuration (composed from above vars)
-      DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:-m3t4mcp}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
-
+      DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
+      
       # Application URL configuration
       APP_URL: ${APP_URL:-http://localhost:12008}
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
 
       # Auth configuration
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-your-super-secret-key-change-this-in-production}
-
+      #
+      # BETTER_AUTH_SECRET is REQUIRED and deliberately has no fallback, for
+      # the same reason POSTGRES_PASSWORD above has none. The literal this
+      # line used to default to is published in this repository, and this one
+      # is the SESSION SIGNING KEY: anyone holding it can mint a session
+      # cookie for any account, so a deployment that never set the variable
+      # was authenticating against a key the whole internet can read. It also
+      # keys the OAuth consent-request signatures.
+      #
+      # Unlike POSTGRES_PASSWORD there is no initdb coupling, so an existing
+      # deployment can change this value freely. Doing so invalidates every
+      # session and consent request signed with the old key, which logs
+      # everyone out once. That is the correct trade against a published key.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env (see example.env)}
+      
       # Docker networking fix
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}
 
-      # =================================================================      # ========================================================================
+      # ========================================================================
+      # NOSUPERUSER runtime database role (optional, off by default)
+      # ========================================================================
+      # DATABASE_URL above is the postgres:16-alpine bootstrap SUPERUSER, and
+      # it serves both `drizzle-kit migrate` and the running gateway. Superusers
+      # bypass GRANTs and can disable or drop a trigger, so the append-only
+      # triggers on `audit_log` are bypassable by the credential the gateway
+      # holds while it serves traffic. Setting the variable below splits the
+      # two: migrations keep DATABASE_URL, the request path gets a NOSUPERUSER
+      # role that can append to the audit tables and not rewrite them.
+      #
+      # No `environment:` entry is needed — `env_file: .env` above already
+      # passes these into the container. Uncomment in .env instead:
+      #
+      #   METAMCP_RUNTIME_DB_PASSWORD=<a strong password>   # the switch
+      #   METAMCP_RUNTIME_DB_ROLE=metamcp_runtime           # optional, this is the default
+      #
+      # Unset = today's behaviour, byte for byte. Cutover is: set the variable,
+      # `docker compose up -d`, then confirm the boot log line "Runtime DB role
+      # check ... rolsuper=false". See README § Security and example.env.
+
+      # ========================================================================
+      # White-label branding (optional)
+      # ========================================================================
+      # Unset = the Umbrella branding this image has always shipped. Setting
+      # any of these rebrands that surface without an image rebuild — the
+      # frontend resolves them per request, so `docker compose up -d` (or any
+      # container restart) is enough.
+      #
+      # No `environment:` entry is needed for these: `env_file: .env` above
+      # already passes them into the container, and docker-entrypoint.sh
+      # promotes the short names to the NEXT_PUBLIC_-prefixed ones the
+      # frontend reads. Just put them in .env:
+      #
+      #   BRANDING_PRODUCT_NAME="Personal MCP Gateway"   # browser-tab title
+      #   BRANDING_ORG_NAME="Ivantsov"                   # name beside the logo
+      #   BRANDING_LOGO_PATH="/branding/logo.png"        # see volume below
+      #   BRANDING_DESCRIPTION="..."                     # <meta description>
+      #
+      # A custom logo is a mounted file, not a rebuild — add to `volumes:`:
+      #
+      #   - ./branding/logo.png:/app/apps/frontend/public/branding/logo.png:ro
+      #
+      # Mount a file (or a subdirectory such as .../public/branding), never
+      # .../public itself — that would shadow the bundled assets. Next
+      # enumerates public/ once at server start, so the file has to exist
+      # before the container starts; swapping it later needs a restart.
+
+      # ========================================================================
       # Bootstrap Configuration Examples
       # ========================================================================
 
@@ -60,26 +130,31 @@ services:
       #   ]
 
       # API Keys - Assign keys to specific users using user_email
+      #
+      # "key" is REQUIRED and is a value YOU generate (min 32 chars, high
+      # entropy - e.g. `openssl rand -hex 32`). The database stores only a
+      # SHA-256 of each key, so bootstrap cannot generate one and report it
+      # back to you afterwards: there is nowhere to read it from, and no
+      # rotate endpoint. An entry without "key" is skipped with a warning.
+      # Re-declaring a different value for an existing name rotates that key.
       # BOOTSTRAP_API_KEYS: |
       #   [
       #     {
       #       "name": "Admin Production Key",
       #       "is_public": false,
-      #       "user_email": "admin@company.com"
+      #       "user_email": "admin@company.com",
+      #       "key": "sk_mt_REPLACE_WITH_openssl_rand_hex_32"
       #     },
       #     {
       #       "name": "Developer Key",
       #       "is_public": false,
-      #       "user_email": "developer@company.com"
-      #     },
-      #     {
-      #       "name": "Analyst Key",
-      #       "is_public": false,
-      #       "user_email": "analyst@company.com"
+      #       "user_email": "developer@company.com",
+      #       "key": "sk_mt_REPLACE_WITH_ANOTHER_SECRET"
       #     },
       #     {
       #       "name": "Public API Key",
-      #       "is_public": true
+      #       "is_public": true,
+      #       "key": "sk_mt_REPLACE_WITH_A_THIRD_SECRET"
       #     }
       #   ]
 
@@ -189,7 +264,8 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m3t4mcp}
+      # Required, no fallback — see the note in the app service above.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}
     ports:
       - "${POSTGRES_EXTERNAL_PORT:-9433}:5432"
     volumes:

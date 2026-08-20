@@ -11,21 +11,30 @@ services:
       - "12008:12008"
     environment:
       # Postgres connection details
+      #
+      # POSTGRES_PASSWORD is REQUIRED and deliberately has no fallback: the
+      # default this line used to carry is published in this repository, and a
+      # throwaway stack is exactly the one people forget is listening on a
+      # host port. Compose refuses to render with the message below rather
+      # than booting Postgres on a guessable credential.
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m3t4mcp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
       
       # Database configuration (composed from above vars)
-      DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:-m3t4mcp}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
       
       # Application URL configuration
       APP_URL: ${APP_URL:-http://localhost:12008}
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
       
       # Auth configuration
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-your-super-secret-key-change-this-in-production}
+      # Required, no fallback — see the note in docker-compose.yml. This is
+      # the session signing key, and the default it used to carry is
+      # published in this repository.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env (see example.env)}
       
       # Docker networking fix
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}
@@ -47,7 +56,8 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m3t4mcp}
+      # Required, no fallback — see the note in the app service above.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}
     ports:
       - "${POSTGRES_EXTERNAL_PORT:-9433}:5432"
     volumes:

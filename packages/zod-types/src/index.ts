@@ -1,3 +1,4 @@
+export * from "./access-groups.zod";
 export * from "./api.zod";
 export * from "./mcp-servers.zod";
 export * from "./namespaces.zod";
@@ -8,3 +9,4 @@ export * from "./logs.zod";
 export * from "./metamcp.zod";
 export * from "./api-keys.zod";
 export * from "./config.zod";
+export * from "./users.zod";

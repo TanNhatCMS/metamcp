@@ -4,13 +4,18 @@
  * namespaces.updateToolStatus — writes to the shared tools catalog),
  * logs.clear (destructive, gateway-wide), and oauth.upsert (writes upstream
  * MCP-server OAuth credentials, a server-config surface) to adminProcedure.
+ * `logs.clear` has since been REMOVED outright — see its describe block
+ * below, which now asserts absence.
  *
  * Pre-condition verified by code inspection: `namespaces.refreshTools`
- * (member-accessible, kept as-is — see namespaces-curation-admin.test.ts)
- * calls `toolsRepository.bulkUpsert` directly from
- * `apps/backend/src/trpc/namespaces.impl.ts`, never routing through the
- * `tools.create`/`tools.sync` tRPC procedures gated here. Gating those two
- * procedures therefore has no effect on the refreshTools member path.
+ * (still protectedProcedure, so a non-admin owner keeps it — see
+ * namespaces-curation-admin.test.ts) calls `toolsRepository.bulkUpsert`
+ * directly from `apps/backend/src/trpc/namespaces.impl.ts`, never routing
+ * through the `tools.create`/`tools.sync` tRPC procedures gated here.
+ * Gating those two procedures therefore had no effect on the refreshTools
+ * path — which is why that path needed its own gate for the PUBLIC-namespace
+ * case, added in the impl and pinned by
+ * `namespaces.refresh-tools.impl.test.ts`.
  */
 
 import {
@@ -67,26 +72,73 @@ describe("tools.create / tools.sync — admin gate", () => {
   });
 });
 
-describe("logs.clear — admin gate", () => {
+/**
+ * `logs.clear` used to be gated here. It is now GONE, and this suite asserts
+ * absence rather than a gate.
+ *
+ * The gate was never the problem: the procedure only emptied the in-memory
+ * ring buffer, but it was the one admin gesture that erased the live security
+ * view mid-investigation, and it is the exact affordance the operator
+ * requirement forbids — no application or admin path that clears the record.
+ * An admin-gated wipe is still a wipe.
+ *
+ * Asserted against the router's procedure map rather than by calling
+ * `caller.clear()`, because a caller for a missing procedure fails as a plain
+ * TypeError, which is also what a typo in the test would produce.
+ */
+describe("logs.clear — removed, not gated", () => {
+  // Shaped to satisfy the declared `.output()` schemas: both procedures declare
+  // one, so a loose stub fails output validation rather than the gate under
+  // test.
   const buildRouter = () =>
     createLogsRouter({
-      getLogs: vi.fn().mockResolvedValue({ logs: [] }),
-      clearLogs: vi
+      getLogs: vi
         .fn()
-        .mockResolvedValue({ success: true, message: "cleared" }),
+        .mockResolvedValue({ success: true, data: [], totalCount: 0 }),
+      getHistory: vi.fn().mockResolvedValue({
+        success: true,
+        data: [],
+        nextCursor: null,
+        serverNames: [],
+      }),
     });
 
-  it("admin allowed, member FORBIDDEN", async () => {
+  it("the procedure does not exist on the router", () => {
+    const procedures = buildRouter()._def.procedures;
+
+    // The whole procedure map is asserted, not just `clear`'s absence: this is
+    // the router that used to carry a wipe, so any procedure appearing here
+    // should have to be named in a test rather than arriving unnoticed.
+    // `history` is the durable read added with migration 0031 — read-only, same
+    // admin gate as `get`.
+    expect(Object.keys(procedures).sort()).toEqual(["get", "history"]);
+    expect("clear" in procedures).toBe(false);
+  });
+
+  it("logs.get survives and is still admin-gated", async () => {
     const router = buildRouter();
 
-    await expect(router.createCaller(adminCtx).clear()).resolves.toEqual({
+    await expect(router.createCaller(adminCtx).get({})).resolves.toMatchObject({
       success: true,
-      message: "cleared",
     });
 
-    await expect(router.createCaller(memberCtx).clear()).rejects.toMatchObject({
+    await expect(router.createCaller(memberCtx).get({})).rejects.toMatchObject({
       code: "FORBIDDEN",
     });
+  });
+
+  it("logs.history carries the SAME admin gate as logs.get", async () => {
+    const router = buildRouter();
+
+    await expect(
+      router.createCaller(adminCtx).history({}),
+    ).resolves.toMatchObject({ success: true });
+
+    // The durable surface must not be a way around the gate on the live one —
+    // they render the same events.
+    await expect(
+      router.createCaller(memberCtx).history({}),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 });
 

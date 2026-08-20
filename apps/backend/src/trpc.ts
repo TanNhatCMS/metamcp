@@ -3,7 +3,27 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import type { Request, Response } from "express";
 
 import { auth, type Session, type User } from "./auth";
+import { auditRequestContext } from "./lib/audit/audit-emitter";
 import logger from "./utils/logger";
+
+/**
+ * The disabled-account check, reached through a LAZY import.
+ *
+ * `users.repo` pulls in `db/index`, which throws at module load without
+ * DATABASE_URL and constructs a pg Pool. Importing it at the top of this file
+ * would make the tRPC instance itself undloadable without a database — and
+ * error-formatter.test.ts deliberately imports this module with `../auth`
+ * mocked precisely because the instance under test is independent of all
+ * that. Deferring the import keeps that true: the database is touched when a
+ * REQUEST arrives, not when the router is defined.
+ *
+ * ESM caches the module after the first await, so this costs one resolution
+ * on the first authenticated request and nothing thereafter.
+ */
+async function isSessionUserDisabled(userId: string): Promise<boolean> {
+  const { usersRepository } = await import("./db/repositories/users.repo");
+  return usersRepository.isDisabled(userId);
+}
 
 // Extend the base context with Express request/response and auth data
 export interface Context extends BaseContext {
@@ -50,8 +70,32 @@ export const createContext = async ({
         };
 
         if (sessionData?.user && sessionData?.session) {
-          user = sessionData.user;
-          session = sessionData.session;
+          // HALF TWO of `users.disabled` enforcement (migration 0027). The
+          // sign-in hook in auth.ts stops a locked account getting a NEW
+          // session; this stops the sessions it ALREADY holds.
+          //
+          // Both halves are required. Sessions in this fork live 30 days
+          // (BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS), so an attacker who is
+          // disabled while signed in would otherwise keep full access for a
+          // month — the disable button would look like it worked and would
+          // not have. Re-reading the column per request is what makes the
+          // lock take effect on the very next call.
+          //
+          // Dropping the user/session (rather than throwing) makes the
+          // request look UNAUTHENTICATED, so protectedProcedure returns its
+          // normal UNAUTHORIZED and the frontend's existing sign-in redirect
+          // handles it. Fail-closed: if the lookup itself throws, the outer
+          // catch leaves user/session undefined, which is also unauthenticated.
+          const disabled = await isSessionUserDisabled(sessionData.user.id);
+
+          if (disabled) {
+            logger.warn(
+              `Rejected request from disabled account ${sessionData.user.id}`,
+            );
+          } else {
+            user = sessionData.user;
+            session = sessionData.session;
+          }
         }
       }
     }
@@ -65,6 +109,12 @@ export const createContext = async ({
     res,
     user,
     session,
+    // Flattened request attribution for the RBAC/authn denial emitters in
+    // @repo/trpc. That package holds the choke points but cannot type or
+    // import the express `req` on this context, so the three fields it needs
+    // are threaded explicitly. Built from the fields
+    // `middleware/audit-context.middleware` stamped on the request.
+    audit: auditRequestContext(req),
   };
 };
 
@@ -72,15 +122,19 @@ export const createContext = async ({
 //
 // errorFormatter strips `stack` from every error payload. @trpc/server only
 // attaches the stack when its `isDev` flag is on, and `isDev` defaults to
-// `process.env.NODE_ENV !== "production"` — which is always true here,
-// because nothing in the container image or compose files ever sets
-// NODE_ENV. The result was that every 4xx/5xx from a tRPC procedure shipped
-// an internal stack trace (absolute `/app/...` paths, bundled dependency
-// names and versions) to the caller. Stripping it here rather than setting
-// NODE_ENV is deliberate: it holds regardless of how the process is started,
-// and it does not silently change any other NODE_ENV-conditional behaviour
-// in this codebase (redirect-URI validation in routers/oauth/utils.ts reads
-// the same variable).
+// `process.env.NODE_ENV !== "production"`, which makes stack disclosure a
+// property of how the deployment was assembled rather than of this code. The
+// image and the compose files set no NODE_ENV themselves, but both compose
+// files pass the whole `.env` in through `env_file:` and `example.env` ships
+// `NODE_ENV=production` on its first line: a quickstart deployment derived
+// from that file has the flag set, one that dropped or edited the line does
+// not. On the second, every 4xx/5xx from a tRPC procedure shipped an internal
+// stack trace (absolute `/app/...` paths, bundled dependency names and
+// versions) to the caller. Stripping it here UNCONDITIONALLY is the design
+// point: the payload is the same however the process was started, and it does
+// not silently change any other NODE_ENV-conditional behaviour in this
+// codebase (redirect-URI validation in routers/oauth/utils.ts reads the same
+// variable).
 //
 // `code`, `httpStatus`, and `path` stay — clients and the frontend error
 // handling need them, and none of them disclose internals.
