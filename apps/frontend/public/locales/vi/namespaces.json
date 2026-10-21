@@ -10,6 +10,7 @@
   "ownership": "Quyền sở hữu",
   "forMyself": "Cho cá nhân (Riêng tư)",
   "everyone": "Tất cả mọi người (Công khai)",
+  "ownershipPublicNote": "Namespace được dùng chung: mọi người dùng đã đăng nhập đều thấy được, và quản trị viên là người quản lý.",
   "selectServers": "Chọn MCP Server",
   "selectServersDescription": "Chọn các MCP server để đưa vào namespace này",
   "noServersAvailable": "Không có MCP server nào",
@@ -91,7 +92,18 @@
     "toggleTooFast": "Chuyển đổi quá nhanh",
     "toggleTooFastDescription": "Vui lòng đợi trước khi chuyển đổi lại để phiên làm việc được khởi tạo đúng cách.",
     "forceReset": "Buộc đặt lại",
-    "anErrorOccurredWhileDeleting": "Đã xảy ra lỗi khi xóa namespace"
+    "anErrorOccurredWhileDeleting": "Đã xảy ra lỗi khi xóa namespace",
+    "toolPolicy": "Chính sách công cụ",
+    "toolPolicyAllowAll": "Cho phép tất cả",
+    "toolPolicyAllowlist": "Danh sách cho phép",
+    "toolPolicyAllowAllHelp": "Các công cụ không có dòng nào trong mục Quản lý công cụ vẫn được phục vụ, kể cả công cụ được thêm vào server sau này.",
+    "toolPolicyAllowlistHelp": "Chỉ các công cụ đã bật trong mục Quản lý công cụ mới được phục vụ. Công cụ mới sẽ bị ẩn cho đến khi được bật.",
+    "toolPolicySwitchLabel": "Chế độ danh sách cho phép",
+    "toolPolicyConfirmTitle": "Chuyển sang chế độ danh sách cho phép?",
+    "toolPolicyConfirmDescription": "Mọi công cụ trong \"{{name}}\" chưa được bật trong mục Quản lý công cụ sẽ ngừng được liệt kê và ngừng gọi được ngay lập tức, và các công cụ thêm vào server của nó sau này vẫn bị ẩn cho đến khi được bật. Chuyển lại sang cho phép tất cả sẽ khôi phục chúng.",
+    "toolPolicyConfirm": "Chuyển sang danh sách cho phép",
+    "toolPolicyUpdated": "Đã cập nhật chính sách công cụ",
+    "toolPolicyUpdateFailed": "Không thể cập nhật chính sách công cụ"
   },
   "enhancedToolsTable": {
     "toolName": "Tên công cụ",
@@ -182,6 +194,7 @@
   },
   "toolManagement": {
     "toolsOverview": "Tổng quan công cụ:",
+    "server": "server",
     "servers": "máy chủ",
     "active": "hoạt động",
     "fromMetaMCP": "từ MetaMCP",

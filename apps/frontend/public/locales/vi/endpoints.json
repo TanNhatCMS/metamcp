@@ -152,5 +152,7 @@
     "noResults": "Không có kết quả."
   },
   "requireScopedApiKey": "Bắt buộc dùng Khóa API theo phạm vi Endpoint",
-  "requireScopedApiKeyDescription": "Chỉ chấp nhận các khóa API được giới hạn cho endpoint này; từ chối các khóa trên toàn cổng (unscoped). Chỉ áp dụng cho xác thực khóa API — quyền truy cập OAuth không bị ảnh hưởng."
+  "requireScopedApiKeyDescription": "Chỉ chấp nhận các khóa API được giới hạn cho endpoint này; từ chối các khóa trên toàn cổng (unscoped). Chỉ áp dụng cho xác thực khóa API — quyền truy cập OAuth không bị ảnh hưởng.",
+  "restrictedLabel": "Giới hạn theo nhóm truy cập",
+  "restrictedDescription": "Khi bật, chỉ quản trị viên và thành viên của nhóm truy cập đã ánh xạ mới truy cập được endpoint này qua OAuth. Bật tùy chọn này cũng yêu cầu API key có phạm vi endpoint, nên các key không phạm vi trên toàn gateway cũng bị từ chối."
 }

@@ -6,6 +6,8 @@
   "mcpInspector": "MCP Inspector",
   "apiKeys": "Khóa API",
   "oauthClients": "Ứng dụng OAuth",
+  "access": "Truy cập",
+  "accessGroups": "Nhóm truy cập",
   "settings": "Cài đặt",
   "liveLogs": "Nhật ký trực tiếp",
   "application": "Ứng dụng",

@@ -72,5 +72,9 @@
     "required": "Tốc độ tối đa của client là bắt buộc",
     "tooSmall": "Tốc độ tối đa phải lớn hơn 0",
     "tooLarge": "Tốc độ tối đa phải nhỏ hơn 1000000"
+  },
+  "apiKeyAdminPlane": {
+    "noScope": "Key admin-plane (control-plane) không có phạm vi endpoint, hãy bỏ chọn endpoint và lựa chọn tất cả endpoint",
+    "noActsAs": "Key admin-plane (control-plane) không mang danh tính acts-as, hãy bỏ chọn người dùng acts-as"
   }
 }
