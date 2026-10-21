@@ -89,6 +89,7 @@ export async function loadTranslations(
       endpointsVi,
       apiKeysVi,
       oauthClientsVi,
+      accessVi,
       settingsVi,
       searchVi,
       inspectorVi,
@@ -113,6 +114,16 @@ export async function loadTranslations(
         default: {},
       })),
       import("../public/locales/vi/oauth-clients.json").catch(() => ({
+        default: {},
+      })),
+      // The vi access.json is an intentionally EMPTY object, not a missing
+      // file: these imports are resolved statically at build time, so a file
+      // that does not exist fails the build rather than falling into the
+      // .catch(). Empty means the English strings below win the merge — an
+      // honest untranslated fallback instead of a machine-translated one on a
+      // security surface. Filling the file in translates the page with no
+      // further wiring.
+      import("../public/locales/vi/access.json").catch(() => ({
         default: {},
       })),
       import("../public/locales/vi/settings.json").catch(() => ({
@@ -142,6 +153,7 @@ export async function loadTranslations(
         ...englishDict["oauth-clients"],
         ...oauthClientsVi.default,
       },
+      access: { ...englishDict.access, ...accessVi.default },
       settings: { ...englishDict.settings, ...settingsVi.default },
       search: { ...englishDict.search, ...searchVi.default },
       inspector: { ...englishDict.inspector, ...inspectorVi.default },
