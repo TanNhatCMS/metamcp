@@ -4,7 +4,6 @@ import {
   SSEClientTransport,
   SseError,
 } from "@modelcontextprotocol/sdk/client/sse.js";
-import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -18,21 +17,39 @@ import express from "express";
 import { findActualExecutable } from "spawn-rx";
 import { z } from "zod";
 
+import {
+  assertPublicMcpUrl,
+  createGuardedFetch,
+} from "@/lib/metamcp/url-guard";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
 import mcpProxy from "../../lib/mcp-proxy";
 import { transformDockerUrl } from "../../lib/metamcp/client";
+import {
+  MCP_REQUEST_BODY_LIMIT_BYTES,
+  refuseDeclaredOversize,
+} from "../../lib/metamcp/mcp-request-body-limit";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
-import { resolveEnvVariables } from "../../lib/metamcp/utils";
+import {
+  getDefaultEnvironment,
+  resolveEnvVariables,
+} from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
-import { assertPublicMcpUrl, createGuardedFetch } from "./url-guard";
 
-const SSE_HEADERS_PASSTHROUGH = ["authorization"];
+// `x-mcp-actor` is best-effort, client-asserted attribution: it names who an
+// action is on behalf of so backend MCPs (shell-broker, ninja, inventory) can
+// stamp the operator on their audit rows and the shell-broker approval page
+// instead of a generic default. It is NOT an authentication control — the
+// security identity stays the endpoint API-key auth, and for shell-broker the
+// CF-Access-verified approver — so forwarding a caller-set value is safe.
+// Lowercase because Node lowercases incoming header names.
+const SSE_HEADERS_PASSTHROUGH = ["authorization", "x-mcp-actor"];
 const STREAMABLE_HTTP_HEADERS_PASSTHROUGH = [
   "authorization",
   "mcp-session-id",
   "last-event-id",
+  "x-mcp-actor",
 ];
 
 const defaultEnvironment = {
@@ -225,10 +242,20 @@ const findRegisteredStdioServer = async (
  * `args` comes from the stored array rather than from a shell-parse of the
  * request's flattened string, so an argument that legitimately contains a
  * space survives instead of being split into two.
+ *
+ * The child env is the SAME curated allowlist the pool path uses
+ * (`lib/metamcp/utils` getDefaultEnvironment, applied to the server env in
+ * `convertDbServerToParams` and spawned via `lib/metamcp/client.ts`) plus this
+ * server's own resolved env, and NOT a spread of the whole gateway
+ * `process.env`. Matching that curated function rather than the SDK's shorter
+ * default keeps an Inspector-spawned server's inherited env (PATH, proxy and
+ * CA-cert variables) identical to a pool-spawned one, and stops an npx MCP an
+ * admin registers from inheriting DATABASE_URL, BETTER_AUTH_SECRET and every
+ * vendor secret. A server that genuinely needs a gateway variable still names
+ * it explicitly with a `${VAR}` placeholder, which `resolveEnvVariables` fills.
  */
 const buildStdioSpawnParams = (server: DatabaseMcpServer): StdioSpawnParams => {
   const env = {
-    ...process.env,
     ...defaultEnvironment,
     ...resolveEnvVariables(server.env || {}),
   } as Record<string, string>;
@@ -413,6 +440,49 @@ const cleanupSession = async (sessionId: string) => {
   logger.info(`Session ${sessionId} cleanup completed`);
 };
 
+/**
+ * Tear down a POST /mcp session whose first request the transport answered
+ * without initializing it: a body over the limit found while reading it (a
+ * declared oversize never gets this far, see refuseDeclaredOversize),
+ * invalid JSON, or a first request that is not an `initialize`. The client got
+ * no session id, so nothing could ever reach this session again, and without
+ * this its upstream transport (a STDIO child, an SSE stream) stayed open.
+ * `cleanupSession` cannot do it: its maps are filled by `onsessioninitialized`,
+ * which never ran.
+ *
+ * The server transport goes first. Its close reaches the proxy wiring
+ * (lib/mcp-proxy), which marks the server side closed and closes the client
+ * transport itself, so the client transport's close below is normally a no-op
+ * (the SDK transport ignores a second close) rather than the wiring's cue to
+ * close the upstream a second time. It is there for when the wiring did not
+ * run.
+ */
+const closeUninitializedSession = async (
+  sessionId: string,
+  webAppTransport: Transport | undefined,
+  serverTransport: Transport,
+) => {
+  logger.info(
+    `Proxy session ${sessionId} was not initialized; closing its transports`,
+  );
+  try {
+    await serverTransport.close();
+  } catch (error) {
+    logger.error(
+      `Error closing server transport for uninitialized session ${sessionId}:`,
+      error,
+    );
+  }
+  try {
+    await webAppTransport?.close();
+  } catch (error) {
+    logger.error(
+      `Error closing web app transport for uninitialized session ${sessionId}:`,
+      error,
+    );
+  }
+};
+
 const createTransport = async (req: express.Request): Promise<Transport> => {
   const query = req.query;
   // Only the transport type is logged. The whole query used to be dumped here,
@@ -488,7 +558,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     const url = transformDockerUrl(query.url as string);
 
     // The destination is caller-supplied, so it is checked BEFORE anything is
-    // opened and before the database is asked about it — see ./url-guard. The
+    // opened and before the database is asked about it (see the url-guard module). The
     // check is by address range rather than by "is this row registered",
     // because pointing the Inspector at a not-yet-saved public server is a
     // flow that has to keep working.
@@ -570,7 +640,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
   } else if (transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP) {
     const url = transformDockerUrl(query.url as string);
 
-    // Same destination check as the SSE branch above — see ./url-guard.
+    // Same destination check as the SSE branch above (see the url-guard module).
     const target = await assertPublicMcpUrl(url);
 
     // Same caller-scoped row lookup and same in-memory error-state read as the
@@ -631,9 +701,13 @@ serverRouter.get("/mcp", async (req, res) => {
   }
 });
 
-serverRouter.post("/mcp", async (req, res) => {
+// A declared oversize is refused before `createTransport` starts anything.
+serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let serverTransport: Transport | undefined;
+  // Hoisted so the error path below can tell what this request started.
+  let newSessionId: string | undefined;
+  let webAppTransport: StreamableHTTPServerTransport | undefined;
   if (!sessionId) {
     try {
       logger.info("New StreamableHttp connection request");
@@ -683,48 +757,72 @@ serverRouter.post("/mcp", async (req, res) => {
       }
 
       // Generate session ID upfront for better tracking
-      const newSessionId = randomUUID();
+      const sessionIdForRequest = randomUUID();
+      newSessionId = sessionIdForRequest;
 
-      const webAppTransport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => newSessionId,
+      const transportToClient = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionIdForRequest,
+        // See lib/metamcp/mcp-request-body-limit for the value and why.
+        maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
         onsessioninitialized: (sessionId) => {
-          webAppTransports.set(sessionId, webAppTransport);
+          webAppTransports.set(sessionId, transportToClient);
           if (serverTransport) {
             serverTransports.set(sessionId, serverTransport);
           }
           logger.info("Client <-> Proxy  sessionId: " + sessionId);
         },
       });
+      webAppTransport = transportToClient;
       logger.info("Created StreamableHttp client transport");
 
-      await webAppTransport.start();
+      await transportToClient.start();
 
-      // Set up proxy connection with error handling
-      try {
-        mcpProxy({
-          transportToClient: webAppTransport,
-          transportToServer: serverTransport,
-          onCleanup: async () => {
-            await cleanupSession(newSessionId);
-          },
-        });
-      } catch (error) {
-        logger.error(
-          `Error setting up proxy for session ${newSessionId}:`,
-          error,
-        );
-        await cleanupSession(newSessionId);
-        throw error;
-      }
+      // Set up proxy connection. A throw here reaches the catch below, which
+      // closes both transports (the session is not initialized yet).
+      mcpProxy({
+        transportToClient,
+        transportToServer: serverTransport,
+        onCleanup: async () => {
+          await cleanupSession(sessionIdForRequest);
+        },
+      });
 
       // Handle the actual request - don't pass req.body since it wasn't parsed
-      await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
-        req,
-        res,
-      );
+      await transportToClient.handleRequest(req, res);
+
+      // Answered without initializing: no session id went out, so close what
+      // this request started. An initialized session is left as it is.
+      if (transportToClient.sessionId === undefined) {
+        await closeUninitializedSession(
+          sessionIdForRequest,
+          transportToClient,
+          serverTransport,
+        );
+      }
     } catch (error) {
       logger.error("Error in /mcp POST route:", error);
-      res.status(500).json(error);
+      // Close what this request started unless it became a live session. The
+      // proxy wiring or the first request can throw before
+      // `onsessioninitialized` fills the session maps, and `cleanupSession`
+      // finds nothing in empty maps, so the upstream transport (a STDIO child,
+      // an SSE stream) used to stay open with no session id that could ever
+      // reach it. A session that did initialize is left as the success path
+      // leaves it: its id went to the client, which can use it or DELETE it.
+      if (
+        serverTransport &&
+        newSessionId &&
+        webAppTransports.get(newSessionId) !== webAppTransport
+      ) {
+        await closeUninitializedSession(
+          newSessionId,
+          webAppTransport,
+          serverTransport,
+        );
+      }
+      // A throw after the response started cannot be answered with a status.
+      if (!res.headersSent) {
+        res.status(500).json(error);
+      }
     }
   } else {
     // logger.info(`Received POST message for sessionId ${sessionId}`);

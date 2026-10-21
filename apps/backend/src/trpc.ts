@@ -3,6 +3,7 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import type { Request, Response } from "express";
 
 import { auth, type Session, type User } from "./auth";
+import { CREDENTIAL_NOT_PERMITTED_MESSAGE } from "./lib/api-key-ip-policy";
 import { auditRequestContext } from "./lib/audit/audit-emitter";
 import logger from "./utils/logger";
 
@@ -25,6 +26,20 @@ async function isSessionUserDisabled(userId: string): Promise<boolean> {
   return usersRepository.isDisabled(userId);
 }
 
+/**
+ * The admin-plane (control-plane) bearer resolver (migration 0038), reached
+ * through the SAME lazy import as `isSessionUserDisabled` and for the same
+ * reason: it touches the repositories and thus `db/index`, so importing it at
+ * the top of this file would make the tRPC instance un-loadable without a
+ * database. error-formatter.test.ts imports this module with `../auth` mocked
+ * precisely because the instance is independent of all that; deferring keeps it
+ * so. Costs one resolution on the first bearer request and nothing after.
+ */
+async function resolveAdminPlaneBearer(token: string, req: Request) {
+  const { resolveAdminPlaneSession } = await import("./lib/admin-plane-auth");
+  return resolveAdminPlaneSession(token, req);
+}
+
 // Extend the base context with Express request/response and auth data
 export interface Context extends BaseContext {
   req: Request;
@@ -43,6 +58,9 @@ export const createContext = async ({
 }): Promise<Context> => {
   let user: User | undefined;
   let session: Session | undefined;
+  // Set when an admin-plane bearer was refused by its IP policy (migration
+  // 0041). Thrown AFTER the try/catch below, which swallows everything.
+  let adminPlaneIpDenied = false;
 
   try {
     // Check if we have cookies in the request
@@ -99,9 +117,47 @@ export const createContext = async ({
         }
       }
     }
+
+    // Admin-plane (control-plane) bearer path (migration 0038), reached ONLY
+    // when the cookie block above resolved nothing. COOKIE PRECEDENCE is the
+    // point: if a cookie authenticated, this never runs, so the cookie path
+    // stays byte-identical (the "cookie path unchanged" test) and a browser
+    // carrying a stray Authorization header never changes behaviour. A
+    // control-plane API key presented here authenticates AS its owning user;
+    // resolveAdminPlaneSession fails closed (returns null) for an unknown key,
+    // an inactive key, a data-plane key, a disabled owner, a malformed header,
+    // or the kill switch, and the request then stays unauthenticated exactly as
+    // the disabled-account branch above leaves it. The resolver is DB-backed, so
+    // it is a lazy import (see resolveAdminPlaneBearer) to keep this module
+    // loadable without a database.
+    if (!user && !session) {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.substring(7);
+        const resolved = await resolveAdminPlaneBearer(token, req);
+        if (resolved && "ipDenied" in resolved) {
+          adminPlaneIpDenied = true;
+        } else if (resolved) {
+          user = resolved.user;
+          session = resolved.session;
+        }
+      }
+    }
   } catch (error) {
     // Log error but don't throw - we want to allow unauthenticated requests
     logger.error("Error getting session in tRPC context:", error);
+  }
+
+  // An admin-plane key refused by its IP policy gets 403, not the 401 an
+  // unknown key gets, matching the data plane's answer for the same refusal,
+  // with the same generic sentence. tRPC v11 captures a TRPCError thrown from
+  // createContext and answers every call in the request with it (through the
+  // errorFormatter below), so this needs no change to the procedures.
+  if (adminPlaneIpDenied) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: CREDENTIAL_NOT_PERMITTED_MESSAGE,
+    });
   }
 
   return {

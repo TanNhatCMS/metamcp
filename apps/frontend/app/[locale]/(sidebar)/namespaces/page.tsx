@@ -5,7 +5,7 @@ import {
   createNamespaceFormSchema,
   CreateNamespaceRequest,
 } from "@repo/zod-types";
-import { ChevronDown, Package, Plus, Search } from "lucide-react";
+import { Package, Plus, Search } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
@@ -19,13 +19,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
 import { trpc } from "@/lib/trpc";
@@ -140,20 +135,12 @@ export default function NamespacesPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Package className="h-8 w-8 text-primary" />
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">
-              {t("namespaces:title")}
-            </h1>
-            <p className="text-muted-foreground">
-              {t("namespaces:description")}
-            </p>
-          </div>
-        </div>
-        <div className="flex gap-2">
+    <div className="space-y-6 min-w-0">
+      <PageHeader
+        icon={<Package className="h-8 w-8 text-primary" />}
+        title={t("namespaces:title")}
+        description={t("namespaces:description")}
+        actions={
           <Dialog open={createOpen} onOpenChange={setCreateOpen}>
             <DialogTrigger asChild>
               <Button>
@@ -200,36 +187,19 @@ export default function NamespacesPage() {
                   />
                 </div>
 
+                {/* Fixed, not a choice: a new namespace is always public
+                    (user_id null). The "For myself" option this replaced sent
+                    no owner, which the backend also stores as public, so it
+                    promised privacy it never delivered. See
+                    lib/namespace-ownership.ts. */}
                 <div className="flex flex-col gap-2">
                   <label className="text-sm font-medium">
                     {t("namespaces:ownership")}
                   </label>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="outline"
-                        className="w-full justify-between"
-                        type="button"
-                      >
-                        {form.watch("user_id") === null
-                          ? t("namespaces:everyone")
-                          : t("namespaces:forMyself")}
-                        <ChevronDown className="h-4 w-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-[var(--radix-dropdown-menu-trigger-width)]">
-                      <DropdownMenuItem
-                        onClick={() => form.setValue("user_id", undefined)}
-                      >
-                        {t("namespaces:forMyself")}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onClick={() => form.setValue("user_id", null)}
-                      >
-                        {t("namespaces:everyone")}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                  <p className="text-sm">{t("namespaces:everyone")}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {t("namespaces:ownershipPublicNote")}
+                  </p>
                 </div>
 
                 <div className="flex flex-col gap-2">
@@ -326,8 +296,8 @@ export default function NamespacesPage() {
               </form>
             </DialogContent>
           </Dialog>
-        </div>
-      </div>
+        }
+      />
 
       <NamespacesList />
     </div>

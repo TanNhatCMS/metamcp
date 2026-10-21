@@ -1,14 +1,23 @@
 import express from "express";
+import helmet from "helmet";
 
+import { logBasicAuthEnforcementState } from "./auth";
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
+import { convergeConfiguredAdmins } from "./lib/admin-converge";
+import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
+import { warnIfApiKeyIpPolicyDisabled } from "./lib/api-key-ip-policy";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
+import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import { globalBodyParser } from "./lib/global-body-parser";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
   isAdminHealthRequest,
 } from "./lib/health-upstream";
+import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
+import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
+import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
@@ -22,6 +31,12 @@ import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
 
 const app = express();
+
+// Drop the `X-Powered-By: Express` banner. It names the framework on
+// every response, which is free reconnaissance and buys the caller nothing.
+// The frontend's equivalent (`X-Powered-By: Next.js`) is turned off with
+// `poweredByHeader: false` in apps/frontend/next.config.js.
+app.disable("x-powered-by");
 
 // FIRST registration in this file, and it has to stay first — the mirror of
 // the errorHandler's "has to stay last" at the bottom. Every audit row's
@@ -44,6 +59,19 @@ app.use(auditContextMiddleware);
 // why the OAuth skip is what makes the 256kb router limit bind at all.
 app.use(globalBodyParser);
 
+// App-wide security response headers, ahead of every router. helmet was only
+// mounted per-router on /trpc and /mcp-proxy, so the /api/auth relay (which
+// answers with the session cookie), /health, /metamcp and the OAuth surface
+// each carried whatever the framework left behind: no nosniff, no frame
+// denial, no default CSP. Mounting it here gives them all the same baseline in
+// one place. It sits BEFORE the routers on purpose: the OAuth router's own
+// securityHeaders and the per-router helmet still run afterwards and override
+// the specific headers they set (X-Frame-Options DENY, the OAuth CSP), so this
+// only fills the gaps and never weakens their tighter values. It does not touch
+// the request body or CORS, so the deliberate /api/auth CORS policy mounted
+// below is unaffected.
+app.use(helmet());
+
 // Mount OAuth metadata endpoints at root level for .well-known discovery
 app.use(oauthRouter);
 
@@ -56,14 +84,16 @@ app.use(oauthRouter);
 // allowlist and the reasoning live in ./lib/cors-policy.
 app.use(authApiCorsMiddleware);
 
-// Per-caller cap on password sign-in attempts. AFTER the CORS policy above, so
-// a 429 carries the headers a browser needs to surface it as a 429 rather than
-// as an opaque network failure, and BEFORE the relay, because a request refused
-// after `auth.handler` has run has already spent the password check and written
-// the append-only `auth.login.failure` row this limiter exists to bound. It
-// answers only `POST /api/auth/sign-in/email`; everything else on this surface
-// — SSO, callbacks, session reads, sign-out, dynamic client registration —
-// passes straight through. See ./middleware/auth-signin-rate-limit.middleware.
+// Per-caller cap on the password-carrying POSTs. AFTER the CORS policy above,
+// so a 429 carries the headers a browser needs to surface it as a 429 rather
+// than as an opaque network failure, and BEFORE the relay, because a request
+// refused after `auth.handler` has run has already spent the password check and
+// written the append-only `audit_log` row this limiter exists to bound. It
+// answers `POST /api/auth/sign-in/email` and `POST /api/auth/sign-up/email`
+// (sign-up also carries a password and, with signup disabled, each POST writes
+// an append-only audit row); everything else on this surface — SSO, callbacks,
+// session reads, sign-out, dynamic client registration — passes straight
+// through. See ./middleware/auth-signin-rate-limit.middleware.
 app.use(authSigninRateLimitMiddleware);
 
 // Mount better-auth routes by calling auth API directly. The relay body lives
@@ -99,6 +129,34 @@ async function start(): Promise<void> {
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 
+  // Promote the accounts METAMCP_ADMIN_EMAIL names, then warn if the gateway
+  // still has no administrator (fork issue #196). AFTER bootstrap, so an
+  // account BOOTSTRAP_USERS created on this boot can be promoted on this boot;
+  // BEFORE listening, so no request is served under the pre-converge roles.
+  // Independent of BOOTSTRAP_ENABLE on purpose: an install that never used
+  // bootstrap is exactly the one #196 left with zero admins. Unset variable =
+  // no writes. The helper logs and swallows its own failures; this guard is
+  // defence-in-depth so a future throw cannot stop the gateway starting.
+  try {
+    await convergeConfiguredAdmins();
+  } catch (err) {
+    logger.error("Admin converge: unexpected error (ignored):", err);
+  }
+
+  // Encrypt any legacy plaintext mcp_servers.bearer_token once, then arm the
+  // read path's fail-closed rule. Sequenced AFTER
+  // the 0036 migration (applied before start()) and BEFORE the idle pool warms
+  // in initializeIdleServers() below, so every serverParams the pool builds
+  // reads a converged column. The helper never throws (it logs and, when it
+  // cannot encrypt for lack of a KEK, leaves legacy rows honoured and retries
+  // next boot); this outer guard is defence-in-depth so the gateway still
+  // starts if a future refactor throws out of it.
+  try {
+    await convergeServerBearerTokens();
+  } catch (err) {
+    logger.error("Bearer-token converge: unexpected error (ignored):", err);
+  }
+
   // Auto-nuke pre-deploy `mcp_sessions` rows ONLY when the advertised
   // MCP server-capability set has changed since the last boot.
   // Capability-neutral restarts (OAuth fixes, dep bumps, transport-
@@ -131,6 +189,48 @@ async function start(): Promise<void> {
     // doesn't crash the gateway on boot.
     logger.error("Auto-nuke: unexpected error (ignored):", err);
   }
+
+  // Retired-tool map: load it now so the boot log says how many entries are in
+  // play (and "dropped N" if the platform repository's validator and this
+  // loader ever disagree), or that the feature is inactive. Data only and fail
+  // open: it can only change the text of a call that already failed as an
+  // unknown tool, so it is not fatal and never delays listening. The helper does
+  // not throw; this guard is defence-in-depth.
+  try {
+    initializeRetiredTools();
+  } catch (err) {
+    logger.error("Retired-tools init: unexpected failure (ignored):", err);
+  }
+
+  // Surface any pre-existing endpoint left in the unpaired state
+  // (restricted=true, require_scoped_api_key=false) so an operator can close
+  // the still-open API-key path deliberately. Non-fatal and self-swallowing;
+  // see ./lib/endpoint-pairing-check for why these rows are warned about rather
+  // than auto-migrated.
+  await warnOnUnpairedRestrictedEndpoints();
+
+  // One boot-time signal for the staged rollout of the gateway backend trust
+  // header: absent secret means backends receive no X-Gateway-Auth yet. Kept
+  // near the other boot warnings so the gateway's posture is legible from the
+  // boot log rather than something to prove by hand.
+  warnIfGatewayBackendSecretUnset();
+
+  // One boot-time signal when the admin-plane (control-plane) bearer path has
+  // been switched off with ADMIN_PLANE_TOKEN_AUTH_DISABLED=true (migration
+  // 0038), so an emergency disable is legible in the boot log.
+  warnIfAdminPlaneTokenAuthDisabled();
+
+  // One boot-time signal when API-key IP allowlists are switched off with
+  // API_KEY_IP_POLICY_DISABLED=true (migration 0041), so an emergency disable
+  // is legible in the boot log rather than discovered when a policy that
+  // looks enforced is not.
+  warnIfApiKeyIpPolicyDisabled();
+
+  // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
+  // boot log records whether password login is on. Reads the DB-backed setting,
+  // so it runs here after initializeOnStartup(); the live per-request hook in
+  // auth.ts is the enforcement point either way.
+  await logBasicAuthEnforcementState();
 
   app.listen(12009, async () => {
     console.log(`Server is running on port 12009`);

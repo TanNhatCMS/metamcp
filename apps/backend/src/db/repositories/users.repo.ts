@@ -143,6 +143,59 @@ export function buildUserListQuery(now: Date, limit: number = USER_LIST_LIMIT) {
 }
 
 /**
+ * Accounts whose email equals one of `normalizedEmails` ignoring case, as a
+ * query builder so its SQL can be asserted without a database (the same
+ * reason `buildUserListQuery` is one). Feeds the boot-time admin converge
+ * (`lib/admin-converge.ts`).
+ *
+ * `lower()` is applied on the COLUMN side because `users.email` is unique only
+ * as written. better-auth lowercases an address at sign-up, but an account
+ * created before that, or inserted by hand, can differ from the configured
+ * address in case alone. The caller lowercases its own side, and it treats two
+ * rows that collapse to one address as ambiguous rather than promoting both.
+ */
+export function buildFindUsersByEmailsQuery(normalizedEmails: string[]) {
+  return db
+    .select({
+      id: usersTable.id,
+      email: usersTable.email,
+      role: usersTable.role,
+    })
+    .from(usersTable)
+    .where(inArray(sql`lower(${usersTable.email})`, normalizedEmails));
+}
+
+/**
+ * Promote one account to `admin`, as a query builder (see above).
+ *
+ * The `role <> 'admin'` predicate is what makes the write report whether THIS
+ * call changed the row: an account that is already an administrator matches
+ * nothing and returns no row, so the caller emits its audit event only for a
+ * real promotion and a restart that changes nothing leaves no trace. The SET
+ * names one value, `admin`, so no caller of this builder can lower a role.
+ * Check the configured address again in the UPDATE: another gateway instance
+ * can change the account's email after the lookup, and its id alone would
+ * then promote an account the configuration no longer names.
+ */
+export function buildPromoteToAdminQuery(
+  id: string,
+  normalizedEmail: string,
+  now: Date,
+) {
+  return db
+    .update(usersTable)
+    .set({ role: "admin", updatedAt: now })
+    .where(
+      and(
+        eq(usersTable.id, id),
+        eq(sql`lower(${usersTable.email})`, normalizedEmail),
+        ne(usersTable.role, "admin"),
+      ),
+    )
+    .returning({ id: usersTable.id, email: usersTable.email });
+}
+
+/**
  * Read + administrative surface over the better-auth users table.
  *
  * Account LIFECYCLE (sign-up, password, verification) still belongs to
@@ -198,6 +251,53 @@ export class UsersRepository {
       .where(eq(usersTable.id, id));
 
     return user?.role;
+  }
+
+  /**
+   * Accounts matching any of `normalizedEmails` (already lowercased) ignoring
+   * case. Every match is returned, including several rows for one address,
+   * so the caller can see a case-variant collision instead of having one
+   * silently chosen for it.
+   */
+  async findByEmailsIgnoringCase(
+    normalizedEmails: string[],
+  ): Promise<Array<{ id: string; email: string; role: string }>> {
+    // `inArray` over an empty list is not a query worth sending.
+    if (normalizedEmails.length === 0) return [];
+    return await buildFindUsersByEmailsQuery(normalizedEmails);
+  }
+
+  /**
+   * Set one account's role to `admin` if it is not already. Returns the row
+   * when this call changed it and undefined when it did not (already an
+   * administrator, no such id, or the address changed), so the caller records
+   * only real changes to accounts the configuration still names.
+   */
+  async promoteToAdmin(
+    id: string,
+    normalizedEmail: string,
+  ): Promise<{ id: string; email: string } | undefined> {
+    const [updated] = await buildPromoteToAdminQuery(
+      id,
+      normalizedEmail,
+      new Date(),
+    );
+    return updated;
+  }
+
+  /** How many accounts exist, and how many of them are administrators. */
+  async countAdmins(): Promise<{ admins: number; users: number }> {
+    const [row] = await db
+      .select({
+        users: count(),
+        admins:
+          sql<number>`count(*) filter (where ${usersTable.role} = 'admin')`
+            .mapWith(Number)
+            .as("admins"),
+      })
+      .from(usersTable);
+
+    return { admins: row?.admins ?? 0, users: row?.users ?? 0 };
   }
 
   /**

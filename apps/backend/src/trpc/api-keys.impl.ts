@@ -4,8 +4,13 @@ import {
   CreateApiKeyResponseSchema,
   DeleteApiKeyRequestSchema,
   DeleteApiKeyResponseSchema,
+  GetGlobalIpPolicyResponseSchema,
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
+  SetApiKeyIpPolicyRequestSchema,
+  SetApiKeyIpPolicyResponseSchema,
+  SetGlobalIpPolicyRequestSchema,
+  SetGlobalIpPolicyResponseSchema,
   UpdateApiKeyRequestSchema,
   UpdateApiKeyResponseSchema,
   ValidateApiKeyRequestSchema,
@@ -23,9 +28,54 @@ import {
 } from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
 import { resolveActsAsUserId } from "../lib/api-key-identity";
+import {
+  apiKeyIpPolicyDisabled,
+  type IpPolicyMode,
+  normalizeCidrList,
+} from "../lib/api-key-ip-policy";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { configService } from "../lib/config.service";
 
 const apiKeysRepository = new ApiKeysRepository();
+
+/**
+ * Validate a requested IP policy (migration 0041) for a write, returning the
+ * canonical list. Shared by the per-key and the global setter so both refuse
+ * the same things with the same words. Every refusal is BAD_REQUEST before any
+ * write.
+ *
+ * Two guards beyond CIDR syntax, both against an administrator locking out
+ * callers by accident:
+ *  - enforce with an EMPTY list is refused. It would refuse every request for
+ *    the key (or, globally, for every key that follows the global policy).
+ *    To stop a key, deactivate it; that is the revocation with a name.
+ *  - (per-key only) a mode other than off with allowed_cidrs null is refused:
+ *    a per-key mode is only read when the key has its own list, so accepting
+ *    it would store a setting that does nothing while looking like a policy.
+ */
+function validatedCidrs(
+  cidrs: string[],
+  mode: IpPolicyMode,
+  scope: "key" | "global",
+): string[] {
+  const normalized = normalizeCidrList(cidrs);
+  if (!normalized.ok) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: `Invalid allowlist entries: ${normalized.errors.join("; ")}`,
+    });
+  }
+  if (mode === "enforce" && normalized.cidrs.length === 0) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message:
+        scope === "key"
+          ? "Enforce with an empty list would refuse every request for this key. Add at least one CIDR, or deactivate the key instead."
+          : "Enforce with an empty global list would refuse every key that follows the global policy. Add at least one CIDR.",
+    });
+  }
+  return normalized.cidrs;
+}
 
 export const apiKeysImplementations = {
   create: async (
@@ -34,6 +84,41 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> => {
+    // Admin-plane (control-plane) mint policy (migration 0038), enforced here
+    // and mirrored in the zod superRefine for schema-bypassing callers.
+    // ADMIN-ONLY: only an admin session may mint a control-plane key. PLANE
+    // EXCLUSIVITY: a control-plane key has no endpoint to reach and carries no
+    // acts-as identity, so those data-plane inputs must be absent (and the
+    // mandatory-scope gate below is skipped for it). Owner-must-be-admin is
+    // enforced once the effective owner is resolved. Kept FORBIDDEN/BAD_REQUEST
+    // -before-write, the same shape as the acts-as guards below.
+    if (input.admin_plane === true) {
+      if (!isAdmin) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "Only administrators can create admin-plane (control-plane) API keys.",
+        });
+      }
+      if (
+        input.endpoint_uuid !== undefined ||
+        input.all_endpoints !== undefined
+      ) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "An admin-plane key has no endpoint scope, do not pass endpoint_uuid or all_endpoints.",
+        });
+      }
+      if (input.acts_as_user_id !== undefined) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "An admin-plane key carries no acts-as identity, do not pass acts_as_user_id.",
+        });
+      }
+    }
+
     // RBAC on the mint path. `input.user_id === null` is the public
     // ('everyone') selection; `undefined` means "private to me". A member may
     // only mint keys owned by themselves — they cannot create a public key,
@@ -85,19 +170,25 @@ export const apiKeysImplementations = {
     // either name the ONE endpoint it may reach, or deliberately opt into
     // gateway-wide reach with all_endpoints: true (stored as NULL scope).
     // Silently defaulting to global is impossible.
-    if (input.endpoint_uuid && input.all_endpoints === true) {
-      throw new TRPCError({
-        code: "BAD_REQUEST",
-        message:
-          "Pass either endpoint_uuid or all_endpoints: true, not both — a key is scoped to one endpoint or explicitly global.",
-      });
-    }
-    if (!input.endpoint_uuid && input.all_endpoints !== true) {
-      throw new TRPCError({
-        code: "BAD_REQUEST",
-        message:
-          "An API key must be scoped to an endpoint (endpoint_uuid). To mint a gateway-wide key, pass all_endpoints: true explicitly.",
-      });
+    // Data-plane scope gate. Skipped for an admin-plane key: it is the ONE
+    // place the mandatory-scope rule is relaxed, and only for control-plane
+    // keys, which have no endpoint to name (the guard above already rejected a
+    // scope on them).
+    if (input.admin_plane !== true) {
+      if (input.endpoint_uuid && input.all_endpoints === true) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "Pass either endpoint_uuid or all_endpoints: true, not both, a key is scoped to one endpoint or explicitly global.",
+        });
+      }
+      if (!input.endpoint_uuid && input.all_endpoints !== true) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "An API key must be scoped to an endpoint (endpoint_uuid). To mint a gateway-wide key, pass all_endpoints: true explicitly.",
+        });
+      }
     }
 
     // Identity-requires-scope invariant (mirrors the zod superRefine so it
@@ -121,6 +212,31 @@ export const apiKeysImplementations = {
     // existence lookups below so the ownership invariant rejects without a
     // single DB read.
     const apiKeyUserId = input.user_id !== undefined ? input.user_id : userId;
+
+    // Owner-must-be-admin at mint for an admin-plane key. This is
+    // defense in depth, not the enforcement of record: the owner's role is
+    // re-read fresh per request at authentication, so a later demotion still
+    // fails closed. Rejecting here keeps a useless-and-dangerous artifact, a
+    // member-owned (or public) control-plane key, from being created at all. A
+    // public ('everyone') owner has no user and no role to become; the
+    // requires-owner CHECK forbids it too, but a precise message beats a
+    // constraint error.
+    if (input.admin_plane === true) {
+      if (apiKeyUserId === null) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "An admin-plane key cannot be public ('everyone'), it must be owned by an administrator.",
+        });
+      }
+      const ownerRole = await usersRepository.findRoleById(apiKeyUserId);
+      if (ownerRole !== "admin") {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "An admin-plane key's owner must be an administrator.",
+        });
+      }
+    }
 
     // Ownership invariant (mirrored in both zod superRefines): an
     // identity-bound key must be OWNED by the identity it exercises. This
@@ -174,6 +290,10 @@ export const apiKeysImplementations = {
         // Validated acts-as identity (admin-only, requires the endpoint
         // scope above). NULL = no identity, m365 injection fail-closes.
         acts_as_user_id: input.acts_as_user_id ?? null,
+        // Plane flag (migration 0038). true only after the admin-only +
+        // owner-must-be-admin + plane-exclusivity gates above; the CHECK
+        // constraints refuse a straddling row regardless.
+        admin_plane: input.admin_plane === true,
         is_active: true,
       });
 
@@ -192,6 +312,9 @@ export const apiKeysImplementations = {
           endpoint_uuid: input.endpoint_uuid ?? null,
           all_endpoints: input.all_endpoints === true,
           acts_as_user_id: input.acts_as_user_id ?? null,
+          // Greppable "a control-plane key was minted" (migration 0038). Never
+          // the key itself, detail already carries no credential material.
+          admin_plane: input.admin_plane === true,
         },
       });
 
@@ -328,10 +451,100 @@ export const apiKeysImplementations = {
     }
   },
 
+  // ---- IP allowlists (migration 0041), admin-only at the router ----
+
+  setIpPolicy: async (
+    input: z.infer<typeof SetApiKeyIpPolicyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof SetApiKeyIpPolicyResponseSchema>> => {
+    if (input.allowed_cidrs === null && input.ip_policy_mode !== "off") {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "A per-key mode needs a per-key list. Pass allowed_cidrs with the mode, or allowed_cidrs: null with mode off to make the key follow the global policy.",
+      });
+    }
+    const allowedCidrs =
+      input.allowed_cidrs === null
+        ? null
+        : validatedCidrs(input.allowed_cidrs, input.ip_policy_mode, "key");
+
+    const result = await apiKeysRepository.setIpPolicy(input.uuid, {
+      allowed_cidrs: allowedCidrs,
+      ip_policy_mode: input.ip_policy_mode,
+    });
+    if (!result) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "API key not found" });
+    }
+
+    // After the write, with the value it replaced (read under the same row
+    // lock), so "what did this change" is answerable from the row alone.
+    // CIDRs and modes only: no credential material.
+    emitAdminEvent(actor, {
+      action: "apikey.ip_policy.set",
+      target_type: "api_key",
+      target_id: input.uuid,
+      detail: {
+        name: result.after.name,
+        old_value: result.before,
+        new_value: {
+          allowed_cidrs: result.after.allowed_cidrs,
+          ip_policy_mode: result.after.ip_policy_mode,
+        },
+      },
+    });
+
+    return ApiKeysSerializer.serializeApiKeyIpPolicy(result.after);
+  },
+
+  getGlobalIpPolicy: async (): Promise<
+    z.infer<typeof GetGlobalIpPolicyResponseSchema>
+  > => {
+    const policy = await configService.getApiKeyIpPolicy();
+    return {
+      mode: policy.mode,
+      allowed_cidrs: policy.cidrs,
+      problems: policy.problems,
+      kill_switch_active: apiKeyIpPolicyDisabled(),
+    };
+  },
+
+  setGlobalIpPolicy: async (
+    input: z.infer<typeof SetGlobalIpPolicyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof SetGlobalIpPolicyResponseSchema>> => {
+    const cidrs = validatedCidrs(input.allowed_cidrs, input.mode, "global");
+
+    const { before, after } = await configService.setApiKeyIpPolicy({
+      mode: input.mode,
+      cidrs,
+    });
+
+    emitAdminEvent(actor, {
+      action: "config.api_key_ip_policy.set",
+      target_type: "config_key",
+      target_id: "API_KEY_IP_POLICY",
+      detail: {
+        old_value: { mode: before.mode, allowed_cidrs: before.cidrs },
+        new_value: { mode: after.mode, allowed_cidrs: after.cidrs },
+      },
+    });
+
+    // Read back inside the write transaction so another writer cannot replace
+    // this mutation's response, or a later read failure turn success into 500.
+    return { mode: after.mode, allowed_cidrs: after.cidrs };
+  },
+
   validate: async (
     input: z.infer<typeof ValidateApiKeyRequestSchema>,
   ): Promise<z.infer<typeof ValidateApiKeyResponseSchema>> => {
     try {
+      // NO IP check, deliberately (migration 0041): this is an admin UI
+      // oracle, not an authentication, and it has no caller address worth
+      // judging (the browser's, not the key holder's). Passing one would
+      // make the answer depend on where the administrator is sitting. The
+      // second argument of validateApiKey is the explicit opt-in, so its
+      // absence here is the opt-out; api-keys.impl.test.ts pins it.
       const result = await apiKeysRepository.validateApiKey(input.key);
 
       // Disabled-identity gate (migration 0027). The DATA plane already

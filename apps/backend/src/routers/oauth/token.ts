@@ -1,5 +1,7 @@
+import { randomUUID } from "crypto";
 import express from "express";
 
+import { CREDENTIAL_NOT_PERMITTED_MESSAGE } from "@/lib/api-key-ip-policy";
 import {
   auditRequestContext,
   credentialFingerprint,
@@ -17,6 +19,7 @@ import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
   rateLimitToken,
+  verifyClientSecret,
 } from "./utils";
 
 const tokenRouter = express.Router();
@@ -50,6 +53,54 @@ logger.info(
   `[oauth] token TTLs: access=${ACCESS_TOKEN_EXPIRY}s refresh=${REFRESH_TOKEN_EXPIRY}s`,
 );
 
+/**
+ * Client authentication on the refresh_token grant, for a confidential client
+ * (`client_secret_post` or `client_secret_basic`). RFC 6749 section 6 requires
+ * such a client to authenticate when it refreshes; this handler did not check,
+ * so possession of a confidential client's refresh token alone minted access
+ * tokens. Public (`none`) clients hold no secret and are never affected.
+ *
+ * - `log` (default): evaluate the presented credentials exactly as the
+ *   authorization_code grant does and RECORD the outcome (`verified`,
+ *   `missing`, `invalid`), never the value, then proceed as before. Whether the
+ *   production confidential client sends its secret on refresh is not known,
+ *   so this phase measures before anything is refused.
+ * - `enforce`: refuse anything but `verified` with 401 invalid_client, before
+ *   the token is rotated, so a refused request leaves the chain intact.
+ *
+ * Read per call, like resolveDcrAllowedHosts in ./utils, so a test can switch
+ * modes inside one file and the value in effect is the value in the env.
+ */
+export const OAUTH_REFRESH_CLIENT_AUTH_ENV = "OAUTH_REFRESH_CLIENT_AUTH";
+
+export type RefreshClientAuthMode = "log" | "enforce";
+
+export function resolveRefreshClientAuthMode(): RefreshClientAuthMode {
+  const raw = process.env[OAUTH_REFRESH_CLIENT_AUTH_ENV];
+  if (raw === undefined || raw.trim() === "") {
+    return "log";
+  }
+  const value = raw.trim().toLowerCase();
+  if (value === "log" || value === "enforce") {
+    return value;
+  }
+  // An unrecognised value falls back to `log`, not `enforce`: `log` is the
+  // behaviour every client already has, while guessing `enforce` from a typo
+  // could lock the confidential client out with nothing in the env saying so.
+  // The warning names the value so the operator can see the setting did not
+  // take.
+  logger.warn(
+    `[oauth] ${OAUTH_REFRESH_CLIENT_AUTH_ENV}=${JSON.stringify(raw.slice(0, 40))} is not "log" or "enforce"; using log`,
+  );
+  return "log";
+}
+
+// The effective value at boot, so an operator can confirm the setting was read
+// (not only set) from the startup log.
+logger.info(
+  `[oauth] refresh grant client auth: ${OAUTH_REFRESH_CLIENT_AUTH_ENV}=${resolveRefreshClientAuthMode()}`,
+);
+
 // Umbrella fork: success-path grant observability. Until now the token endpoint
 // logged only FAILURES, so nothing in `app.log` distinguished "the connector
 // refreshed on schedule" from "the connector never refreshed and silently died
@@ -72,12 +123,12 @@ function lastFour(secret: string): string {
 /**
  * Emit one line per successfully issued access token.
  *
- * `clientName` is passed only on the authorization_code path, where the client
- * row is already loaded for auth-method validation. The refresh path never
- * fetches it: a name lookup there would add a DB round-trip to a hot path purely
- * for logging, and it is not needed — every refresh chain begins with an
- * authorization_code grant, so the id-to-name mapping is already in the same log
- * file.
+ * `clientName` is passed only on the authorization_code path. The refresh path
+ * also loads the client row now (for confidential-client authentication, see
+ * OAUTH_REFRESH_CLIENT_AUTH_ENV) but still leaves the name out: it is not
+ * needed, since every refresh chain begins with an authorization_code grant
+ * and the id-to-name mapping is already in the same log file, and adding it
+ * would change every existing refresh line that operators grep.
  */
 function logTokenIssued(fields: {
   grantType: "authorization_code" | "refresh_token";
@@ -90,6 +141,10 @@ function logTokenIssued(fields: {
   // because there was no prior refresh token to rotate, and `rotated=false`
   // there would read as "rotation is off".
   rotatedRefreshToken?: true;
+  // Set only on the refresh path and only for a confidential client (see
+  // OAUTH_REFRESH_CLIENT_AUTH_ENV). Omitted for a public client, whose line
+  // stays byte-identical to what it was before the field existed.
+  clientAuth?: ClientAuthOutcome;
 }) {
   const parts = [
     "[oauth] token issued",
@@ -111,6 +166,9 @@ function logTokenIssued(fields: {
   parts.push(`token=...${lastFour(fields.accessToken)}`);
   if (fields.rotatedRefreshToken) {
     parts.push("rotated=true");
+  }
+  if (fields.clientAuth) {
+    parts.push(`client_auth=${fields.clientAuth}`);
   }
 
   logger.info(parts.join(" "));
@@ -138,6 +196,8 @@ function emitTokenIssued(
     clientName?: string | null;
     userId: string;
     accessToken: string;
+    // Refresh path, confidential client only; see logTokenIssued.
+    clientAuth?: ClientAuthOutcome;
   },
 ): void {
   const audit = auditRequestContext(req);
@@ -161,14 +221,28 @@ function emitTokenIssued(
       client_name: fields.clientName ? fields.clientName.slice(0, 100) : null,
       access_token_sha256: fingerprint.sha256,
       access_token_last4: fingerprint.last4,
+      // The outcome word only. Absent for a public client, so its row keeps
+      // the shape it had before this key existed.
+      ...(fields.clientAuth ? { client_auth: fields.clientAuth } : {}),
     },
   });
 }
 
 /**
  * Issue a new access token + refresh token pair and store them.
+ *
+ * `familyId` ties the pair into a refresh-token family (migration 0037). The
+ * authorization_code grant omits it, starting a NEW family; the refresh grant
+ * passes the rotated row's `family_id`, so a whole rotation chain shares one
+ * family and reuse of any rotated-out member can revoke the entire lineage. The
+ * id is a random uuid, unguessable, so it is never a value a caller can present.
  */
-async function issueTokenPair(clientId: string, userId: string, scope: string) {
+async function issueTokenPair(
+  clientId: string,
+  userId: string,
+  scope: string,
+  familyId: string = randomUUID(),
+) {
   const accessToken = generateSecureAccessToken();
   const refreshToken = generateSecureRefreshToken();
 
@@ -177,11 +251,185 @@ async function issueTokenPair(clientId: string, userId: string, scope: string) {
     user_id: userId,
     scope,
     expires_at: Date.now() + ACCESS_TOKEN_EXPIRY * 1000,
-    refresh_token: refreshToken,
-    refresh_token_expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+    family_id: familyId,
+    // The refresh token and its expiry travel as one pair, so a token can never
+    // be stored with a refresh token but no expiry — the never-reaped,
+    // never-expiring shape migration 0035's CHECK also forbids at the column
+    // level.
+    refresh: {
+      token: refreshToken,
+      expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+    },
   });
 
   return { accessToken, refreshToken };
+}
+
+/**
+ * Client credentials carried in an `Authorization: Basic` header.
+ *
+ * RFC 6749 section 2.3.1: the client id and secret are each encoded with the
+ * application/x-www-form-urlencoded algorithm, then used as the Basic username
+ * and password. So the decoded header splits at its FIRST colon (RFC 7617: a
+ * user-id cannot contain one, a password can) and each half is form-decoded.
+ * Every id and secret this server issues is base64url, which that decoding
+ * leaves unchanged, so clients that skip the encoding step still verify.
+ *
+ * Returns `undefined` when there is no Basic header at all, and `null` when
+ * there is one that cannot be read (no colon, empty id, or a broken percent
+ * escape), so callers can tell "did not try" from "tried and failed".
+ */
+function parseBasicClientCredentials(
+  authorization: string | undefined,
+): { clientId: string; clientSecret: string } | null | undefined {
+  // RFC 9110 11.1 makes auth schemes case-insensitive. Using an exact-case
+  // match would ignore a valid Basic identity on the refresh grant.
+  if (!authorization || !/^Basic /i.test(authorization)) {
+    return undefined;
+  }
+  const decoded = Buffer.from(authorization.substring(6), "base64").toString();
+  const colon = decoded.indexOf(":");
+  if (colon <= 0) {
+    return null;
+  }
+  const formDecode = (value: string) =>
+    decodeURIComponent(value.replace(/\+/g, " "));
+  try {
+    return {
+      clientId: formDecode(decoded.substring(0, colon)),
+      clientSecret: formDecode(decoded.substring(colon + 1)),
+    };
+  } catch {
+    // A malformed percent escape. Unreadable, not absent.
+    return null;
+  }
+}
+
+/**
+ * Work out which client a token request speaks for.
+ *
+ * The body's `client_id` is what this endpoint has always read, and when it is
+ * present it is still the answer, so a `none` or `client_secret_post` client
+ * (every production connector today) takes exactly the path it took before.
+ * A client registered for `client_secret_basic` may send its id ONLY in the
+ * Basic header (RFC 6749 section 2.3.1), so when the body has none, a readable
+ * Basic header supplies it (upstream metatool-ai/metamcp issue #342). Without
+ * this the authorization_code grant refused every such client, and the
+ * refresh_token grant skipped its client check for them.
+ *
+ * When the body and a readable Basic header BOTH name a client and the two
+ * differ, the request is refused with 401 invalid_client, whatever method the
+ * client registered. RFC 6749 section 2.3 says a client MUST NOT use more than
+ * one authentication method in a request, and a request carrying two
+ * different identities has no answer to "which client is this" that is not a
+ * guess: preferring the body would let the header be ignored while it names
+ * someone else, and preferring the header would let a body id be overridden.
+ * The same id in both places is one identity and passes. An unreadable Basic
+ * header is not treated as a conflict: it supplies no identity, so the body
+ * decides as it always has, and a `client_secret_basic` client is still
+ * refused by its own verification below.
+ */
+function resolveRequestClientId(req: express.Request) {
+  // Passed on untouched (not coerced to a string) when it decides the answer,
+  // so a body that worked before reaches the same comparisons with the same
+  // value.
+  const bodyClientId = req.body.client_id;
+  const basic = parseBasicClientCredentials(req.headers.authorization);
+  if (!basic) {
+    return { ok: true as const, clientId: bodyClientId };
+  }
+  if (!bodyClientId) {
+    return { ok: true as const, clientId: basic.clientId };
+  }
+  if (bodyClientId !== basic.clientId) {
+    return { ok: false as const };
+  }
+  return { ok: true as const, clientId: bodyClientId };
+}
+
+function refuseConflictingClientIds(res: express.Response) {
+  return res.status(401).json({
+    error: "invalid_client",
+    error_description:
+      "client_id in the request body does not match the Authorization header",
+  });
+}
+
+/**
+ * What a confidential client's presented credentials amounted to. A word, never
+ * the value: this is what the refresh grant logs and audits.
+ */
+type ClientAuthOutcome = "verified" | "missing" | "invalid";
+
+/**
+ * Evaluate the client credentials a token request carries against the client's
+ * registered `token_endpoint_auth_method`. The ONE implementation both grants
+ * use, so the refresh grant judges a confidential client exactly as the
+ * authorization_code grant always has, and the two cannot drift apart.
+ *
+ * Returns `null` for any method other than `client_secret_basic` and
+ * `client_secret_post` (in practice `none`): such a client holds no secret,
+ * so there is nothing to evaluate and it proceeds as before. Otherwise the
+ * outcome, plus the 401 description the authorization_code grant has always
+ * answered with for it (kept byte-identical).
+ *
+ * `missing` is "no credential for the registered method was sent"; `invalid`
+ * is "one was sent and it did not verify", which includes an unreadable Basic
+ * header and a Basic header naming a different client. The secret half is
+ * verified against the salted hash at rest (migration 0036) in constant time
+ * (verifyClientSecret -> timingSafeEqualSecret), so the token endpoint is not a
+ * timing oracle for a confidential client's secret.
+ */
+function evaluateClientCredentials(
+  req: express.Request,
+  client: {
+    client_id: string;
+    token_endpoint_auth_method: string;
+    client_secret: string | null;
+    client_secret_salt?: string | null;
+  },
+): { outcome: ClientAuthOutcome; refusal: string } | null {
+  if (client.token_endpoint_auth_method === "client_secret_basic") {
+    // The same parser resolveRequestClientId used, so the id that picked this
+    // client and the credentials verified here can never be read differently.
+    const credentials = parseBasicClientCredentials(req.headers.authorization);
+    if (credentials === undefined) {
+      return {
+        outcome: "missing",
+        refusal: "Client authentication required via Basic auth",
+      };
+    }
+    // The client_id half is not a secret, so a plain compare is fine.
+    if (
+      credentials === null ||
+      credentials.clientId !== client.client_id ||
+      !verifyClientSecret(
+        credentials.clientSecret,
+        client.client_secret,
+        client.client_secret_salt,
+      )
+    ) {
+      return { outcome: "invalid", refusal: "Invalid client credentials" };
+    }
+    return { outcome: "verified", refusal: "" };
+  }
+  if (client.token_endpoint_auth_method === "client_secret_post") {
+    const { client_secret } = req.body;
+    if (!client_secret) {
+      return { outcome: "missing", refusal: "Invalid client secret" };
+    }
+    if (
+      !verifyClientSecret(
+        client_secret,
+        client.client_secret,
+        client.client_secret_salt,
+      )
+    ) {
+      return { outcome: "invalid", refusal: "Invalid client secret" };
+    }
+    return { outcome: "verified", refusal: "" };
+  }
+  return null;
 }
 
 /**
@@ -237,7 +485,15 @@ async function handleAuthorizationCodeGrant(
   req: express.Request,
   res: express.Response,
 ) {
-  const { code, redirect_uri, client_id, code_verifier } = req.body;
+  const { code, redirect_uri, code_verifier } = req.body;
+
+  // Resolved before anything is read, so a request naming two different
+  // clients is refused without touching the code (see resolveRequestClientId).
+  const resolvedClient = resolveRequestClientId(req);
+  if (!resolvedClient.ok) {
+    return refuseConflictingClientIds(res);
+  }
+  const client_id = resolvedClient.clientId;
 
   // Validate authorization code
   if (!code) {
@@ -310,41 +566,17 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Validate client authentication based on registered auth method
-  if (clientData.token_endpoint_auth_method === "client_secret_basic") {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Basic ")) {
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: "Client authentication required via Basic auth",
-      });
-    }
-
-    const credentials = Buffer.from(
-      authHeader.substring(6),
-      "base64",
-    ).toString();
-    const [authClientId, authClientSecret] = credentials.split(":");
-
-    if (
-      authClientId !== client_id ||
-      authClientSecret !== clientData.client_secret
-    ) {
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: "Invalid client credentials",
-      });
-    }
-  } else if (clientData.token_endpoint_auth_method === "client_secret_post") {
-    const { client_secret } = req.body;
-    if (!client_secret || client_secret !== clientData.client_secret) {
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: "Invalid client secret",
-      });
-    }
+  // Validate client authentication based on registered auth method. The row was
+  // loaded by `client_id`, which already matched the code's client above, so
+  // the Basic header's id is compared against the same value it always was.
+  // For the "none" auth method there is nothing to evaluate (null).
+  const clientAuth = evaluateClientCredentials(req, clientData);
+  if (clientAuth && clientAuth.outcome !== "verified") {
+    return res.status(401).json({
+      error: "invalid_client",
+      error_description: clientAuth.refusal,
+    });
   }
-  // For "none" auth method, no additional validation needed
 
   // OAuth 2.1 Security: PKCE is mandatory for all clients
   if (!codeData.code_challenge) {
@@ -362,15 +594,19 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Verify code challenge
+  // Verify code challenge. Only S256 is honored — the "plain" method is
+  // rejected rather than verified. The AS metadata advertises S256 only, and a
+  // "plain" challenge equals the verifier and travels in the /oauth/authorize
+  // query string (logged, left in browser history), so it gives no protection
+  // against code interception. The authorize handler refuses to mint a "plain"
+  // code, so a stored one is not reachable through the normal flow; this branch
+  // is the defense-in-depth twin that refuses it here too.
   const crypto = await import("crypto");
   let challengeFromVerifier: string;
 
   if (codeData.code_challenge_method === "S256") {
     const hash = crypto.createHash("sha256").update(code_verifier).digest();
     challengeFromVerifier = hash.toString("base64url");
-  } else if (codeData.code_challenge_method === "plain") {
-    challengeFromVerifier = code_verifier;
   } else {
     return res.status(400).json({
       error: "invalid_grant",
@@ -405,8 +641,18 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Code is valid, delete it (authorization codes are single-use)
-  await oauthRepository.deleteAuthCode(code);
+  // Code is valid; consume it atomically. Single-use is enforced by the DELETE
+  // itself (consumeAuthCode is DELETE ... RETURNING), not by the earlier read:
+  // on two concurrent redemptions of the same code only one delete removes the
+  // row, so exactly one caller proceeds and the loser is refused invalid_grant
+  // rather than both minting a token pair for the same code.
+  const consumed = await oauthRepository.consumeAuthCode(code);
+  if (!consumed) {
+    return res.status(400).json({
+      error: "invalid_grant",
+      error_description: "Invalid or expired authorization code",
+    });
+  }
 
   // Issue access token + refresh token
   const { accessToken, refreshToken } = await issueTokenPair(
@@ -451,7 +697,17 @@ async function handleRefreshTokenGrant(
   req: express.Request,
   res: express.Response,
 ) {
-  const { refresh_token, client_id } = req.body;
+  const { refresh_token } = req.body;
+
+  // Before the token is read, so a request naming two different clients
+  // neither rotates nor revokes anything (see resolveRequestClientId). A
+  // `client_secret_basic` client's id now comes from its header, which is what
+  // makes the client check below apply to it instead of being skipped.
+  const resolvedClient = resolveRequestClientId(req);
+  if (!resolvedClient.ok) {
+    return refuseConflictingClientIds(res);
+  }
+  const client_id = resolvedClient.clientId;
 
   if (!refresh_token) {
     return res.status(400).json({
@@ -463,15 +719,57 @@ async function handleRefreshTokenGrant(
   // Look up the token row by refresh_token
   const tokenData = await oauthRepository.getByRefreshToken(refresh_token);
   if (!tokenData) {
+    // Not a live token — but it may be a refresh token this family already
+    // rotated OUT (migration 0037). Refresh tokens are single-use, so a
+    // rotated-out token presented again is reuse: either the legitimate client
+    // is a step behind (its rotation reply was lost) or the token was stolen
+    // and the thief rotated it. Both are handled the safe way — revoke the
+    // whole family — because the two are indistinguishable at the wire and
+    // leaving the live chain running is the failure that matters. The reuse row
+    // is emitted BEFORE the revoke, and never awaited, for the reason
+    // emitTokenLifecycle documents: the record has to survive a delete that
+    // throws, and the delete is exactly what destroys the family being
+    // investigated. Collapsing the family (live rows AND markers) makes a
+    // replay after revocation take this same branch with no marker to match, so
+    // it falls through to the unknown-token response below — one reuse row per
+    // family compromise, not one per replay.
+    const reused = await oauthRepository.getRotatedRefreshToken(refresh_token);
+    if (reused) {
+      emitTokenLifecycle(req, {
+        action: "oauth.token.reuse",
+        clientId: reused.client_id,
+        userId: reused.user_id,
+        token: refresh_token,
+        outcome: "denied",
+        httpStatus: 400,
+        detail: {
+          reason: "refresh_token_reuse",
+          family_id: reused.family_id,
+        },
+      });
+      const revoked = await oauthRepository.revokeFamily(reused.family_id);
+      logger.warn(
+        `[oauth] refresh token reuse detected; family revoked ` +
+          `client=${reused.client_id} user=${reused.user_id} tokens_revoked=${revoked}`,
+      );
+    }
+    // Byte-identical to the reuse response above and to the disabled-account
+    // and expired branches: a holder of a stolen or stale refresh token learns
+    // only "this no longer works", never that they tripped detection.
     return res.status(400).json({
       error: "invalid_grant",
       error_description: "Invalid refresh token",
     });
   }
 
-  // Check refresh token expiry
+  // Check refresh token expiry. A NULL expiry is treated as expired, NOT as
+  // "valid forever": a row with a refresh token and no expiry is the
+  // never-reaped shape (see migration 0035), and honoring it would
+  // make it an immortal credential. Migration 0035's CHECK makes that shape
+  // unrepresentable going forward; this guard is the defense-in-depth twin that
+  // refuses a legacy row if one ever presents it.
   if (
-    tokenData.refresh_token_expires_at &&
+    !tokenData.refresh_token_expires_at ||
     Date.now() > tokenData.refresh_token_expires_at.getTime()
   ) {
     // Emitted BEFORE the delete, and never awaited — `emit` is fire-and-forget
@@ -480,14 +778,13 @@ async function handleRefreshTokenGrant(
     // row is that the credential it describes no longer exists to be looked
     // up, so writing it after the destruction would lose it in exactly the
     // case an operator is investigating.
-    const destroyed = credentialFingerprint(tokenData.access_token);
     emitTokenLifecycle(req, {
       action: "oauth.token.refresh",
       clientId: tokenData.client_id,
       userId: tokenData.user_id,
       // The refresh token as PRESENTED — `token_sha256` in the row. It is a
       // different string from the access token in the same row, which is
-      // fingerprinted separately below.
+      // recorded separately below.
       token: refresh_token,
       outcome: "failure",
       httpStatus: 400,
@@ -497,15 +794,19 @@ async function handleRefreshTokenGrant(
         // The destroyed row's ACCESS token, under the same keys
         // `emitTokenIssued` writes — this is the join back to the
         // `oauth.token.issue` / `oauth.token.refresh` row that minted the
-        // chain, which is the only place its age is now recorded.
-        access_token_sha256: destroyed.sha256,
-        access_token_last4: destroyed.last4,
+        // chain, which is the only place its age is now recorded. Since
+        // migration 0036 the stored `access_token` IS the sha256 the audit log
+        // records, and `access_token_last4` its tail, so they are used directly
+        // passing the stored hash through credentialFingerprint would hash it
+        // a second time and break the join.
+        access_token_sha256: tokenData.access_token,
+        access_token_last4: tokenData.access_token_last4,
         created_at: isoOrNull(tokenData.created_at),
         expires_at: isoOrNull(tokenData.expires_at),
         refresh_token_expires_at: isoOrNull(tokenData.refresh_token_expires_at),
       },
     });
-    await oauthRepository.deleteAccessToken(tokenData.access_token);
+    await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
     return res.status(400).json({
       error: "invalid_grant",
       error_description: "Refresh token has expired",
@@ -518,6 +819,70 @@ async function handleRefreshTokenGrant(
       error: "invalid_client",
       error_description: "Client ID does not match",
     });
+  }
+
+  // Confidential-client authentication (RFC 6749 section 6), per
+  // OAUTH_REFRESH_CLIENT_AUTH_ENV. The client is the one the token was ISSUED
+  // to, not whatever the request names: a request that named a different
+  // client was refused just above, and one that named none is still the
+  // token's client, so this is the row whose secret must be shown.
+  //
+  // Before the disabled check and the rotation below, for the reason the
+  // disabled check gives: a refusal here must leave the token row intact, so a
+  // misconfigured client that is fixed can still refresh.
+  const clientAuthMode = resolveRefreshClientAuthMode();
+  const clientData = await oauthRepository.getClient(tokenData.client_id);
+  if (!clientData) {
+    // Unreachable except in a race: access tokens reference oauth_clients with
+    // ON DELETE CASCADE, so a token cannot outlive its client row. Without a
+    // row there is no method to judge by. `enforce` refuses (fail closed);
+    // `log` proceeds as before, where the mint below fails on that same
+    // foreign key.
+    logger.warn(
+      `[oauth] refresh client auth outcome=client_not_found mode=${clientAuthMode} client=${tokenData.client_id} user=${tokenData.user_id}`,
+    );
+    if (clientAuthMode === "enforce") {
+      return res.status(401).json({
+        error: "invalid_client",
+        error_description: "Client not found or not registered",
+      });
+    }
+  }
+  // A JSON body can put an object or array in client_secret. Hashing coerces
+  // it to a string, which can throw (an object with a non-callable toString)
+  // or authenticate an array containing the secret. Refresh must classify
+  // malformed credentials without breaking log mode's existing response;
+  // keep the authorization-code grant's existing evaluation unchanged.
+  const clientAuth: ReturnType<typeof evaluateClientCredentials> =
+    clientData?.token_endpoint_auth_method === "client_secret_post" &&
+    req.body.client_secret &&
+    typeof req.body.client_secret !== "string"
+      ? { outcome: "invalid", refusal: "Invalid client secret" }
+      : clientData
+        ? evaluateClientCredentials(req, clientData)
+        : null;
+  if (clientAuth && clientAuth.outcome !== "verified") {
+    if (clientAuthMode === "enforce") {
+      // Not audited, by the doctrine on emitTokenLifecycle: the refusal
+      // destroys nothing, so it is not self-limiting and a replay would write
+      // a row per attempt. The log line is the record, matching the disabled
+      // refusal below.
+      logger.warn(
+        `[oauth] token rejected reason=client_auth_${clientAuth.outcome} grant=refresh_token ` +
+          `method=${clientData?.token_endpoint_auth_method} client=${tokenData.client_id} user=${tokenData.user_id}`,
+      );
+      return res.status(401).json({
+        error: "invalid_client",
+        error_description: clientAuth.refusal,
+      });
+    }
+    // `log`: record and proceed. The issued line and the audit row below carry
+    // the same outcome; this WARN is what makes an unauthenticated refresh
+    // stand out before enforcement is switched on.
+    logger.warn(
+      `[oauth] refresh client auth outcome=${clientAuth.outcome} mode=log ` +
+        `method=${clientData?.token_endpoint_auth_method} client=${tokenData.client_id} user=${tokenData.user_id}`,
+    );
   }
 
   // `users.disabled` enforcement (migration 0027) — the plane the 2026-08-13
@@ -548,14 +913,36 @@ async function handleRefreshTokenGrant(
     });
   }
 
-  // Delete old token row (rotation: old refresh token is single-use)
-  await oauthRepository.deleteAccessToken(tokenData.access_token);
+  // Record the rotated-out refresh token BEFORE deleting the row, so a later
+  // presentation of it is detected as reuse (migration 0037). The marker is
+  // keyed on the stored hash — tokenData.refresh_token is already that digest,
+  // so it is passed through unchanged rather than re-hashed. The row was found
+  // BY its refresh token and passed the expiry guard above, so both the hash
+  // and its expiry are present on the real path; the guard only satisfies the
+  // nullable column types. Recorded before the delete so there is no window in
+  // which the token is neither live nor marked as rotated.
+  if (tokenData.refresh_token && tokenData.refresh_token_expires_at) {
+    await oauthRepository.recordRotatedRefreshToken({
+      refreshTokenHash: tokenData.refresh_token,
+      familyId: tokenData.family_id,
+      clientId: tokenData.client_id,
+      userId: tokenData.user_id,
+      expiresAt: tokenData.refresh_token_expires_at,
+    });
+  }
 
-  // Issue new access token + refresh token
+  // Delete old token row (rotation: old refresh token is single-use). The row
+  // is in hand from getByRefreshToken, so delete by its stored hash rather than
+  // re-hashing it through deleteAccessToken.
+  await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
+
+  // Issue new access token + refresh token. The new pair inherits the rotated
+  // row's family, so reuse of any rotated-out member revokes the whole chain.
   const { accessToken, refreshToken } = await issueTokenPair(
     tokenData.client_id,
     tokenData.user_id,
     tokenData.scope,
+    tokenData.family_id,
   );
 
   // `rotated=true` is unconditional here because this handler always mints a
@@ -568,6 +955,7 @@ async function handleRefreshTokenGrant(
     userId: tokenData.user_id,
     accessToken,
     rotatedRefreshToken: true,
+    clientAuth: clientAuth?.outcome,
   });
 
   emitTokenIssued(req, {
@@ -576,6 +964,7 @@ async function handleRefreshTokenGrant(
     clientId: tokenData.client_id,
     userId: tokenData.user_id,
     accessToken,
+    clientAuth: clientAuth?.outcome,
   });
 
   res.json({
@@ -639,6 +1028,17 @@ function isoOrNull(value: Date | null | undefined): string | null {
  *    token, and it is rate-limited on top, so it is not replay amplification.
  *    A caller naming a different client than the token was issued to is not a
  *    confused client.
+ *  - REFRESH-TOKEN REUSE that revokes a family (migration 0037): emitted, and
+ *    it is the highest-signal event on the grant half of /oauth/token. It is
+ *    reachable only by presenting a refresh token that was already rotated OUT
+ *    of a live family, and detection COLLAPSES the family — the live rows and
+ *    the rotated-token markers alike — so a replay of the same token afterwards
+ *    finds no marker and falls through to the silent unknown-token path. That
+ *    is the bound: one reuse row per family compromise, not one per replay,
+ *    which is tighter than the destroy-attempt bound below. `outcome` is
+ *    `denied` rather than `failure`, so a query for active attacks filters on
+ *    it. Emit-first here too — the revoke is the delete that must not be able to
+ *    lose the record.
  *  - A REJECTION THAT DESTROYS THE ROW IT JUST READ: emitted. Three branches
  *    qualify — an EXPIRED AUTHORIZATION CODE and an EXPIRED REFRESH TOKEN on
  *    /oauth/token, and an EXPIRED ACCESS TOKEN on /oauth/introspect. Each is
@@ -654,8 +1054,10 @@ function isoOrNull(value: Date | null | undefined): string | null {
  *    row's `access_token_sha256` joins this row to the `oauth.token.issue` row
  *    that minted it.
  *  - Every OTHER refusal on the grant half of /oauth/token — missing or
- *    mismatched client, bad client secret, PKCE failure, unknown code, unknown
- *    refresh token, disabled account: still NOTHING here. None of them
+ *    mismatched client, bad client secret (on either grant, including the
+ *    refresh grant's `OAUTH_REFRESH_CLIENT_AUTH=enforce` refusal), PKCE
+ *    failure, unknown code, unknown refresh token, disabled account: still
+ *    NOTHING here. None of them
  *    destroys a row, so none is self-limiting; an invented code or refresh
  *    token can be replayed forever. The two disabled-account refusals also
  *    leave the row deliberately intact, because disable must stay reversible,
@@ -666,10 +1068,13 @@ function isoOrNull(value: Date | null | undefined): string | null {
  * atomic and neither delete reports whether it removed anything —
  * `deleteAccessToken` and `deleteAuthCode` both return void — so N concurrent
  * presentations of the SAME expired credential each read the row before the
- * first delete commits, and each writes a row. /oauth/token is per-IP limited
- * by `rateLimitToken` and /oauth/introspect sits behind the failure limiter
- * plus the RFC 7662 credential gate; GET /oauth/userinfo carries no limiter at
- * all, so it is the one a burst actually reaches. Emit-first is the half of
+ * first delete commits, and each writes a row. /oauth/token is per-edge-IP
+ * limited by `rateLimitToken`, /oauth/introspect sits behind the failure
+ * limiter plus the RFC 7662 credential gate, and GET /oauth/userinfo now
+ * carries the same failure-only limiter (see userinfo.ts) — but that limiter
+ * counts failures rather than successes, so a burst of the SAME expired token
+ * can still spend a window's worth of destroy-emits before the bucket fills.
+ * Emit-first is the half of
  * that trade being kept ON PURPOSE: the record has to survive a delete that
  * throws, which is the case an operator is investigating, and buying
  * exactly-once instead would mean gating the emit on a delete that returns a
@@ -698,11 +1103,15 @@ function emitTokenLifecycle(
       | "oauth.token.issue"
       | "oauth.token.refresh"
       | "oauth.token.introspect"
-      | "oauth.token.revoke";
+      | "oauth.token.revoke"
+      | "oauth.token.reuse";
     clientId: string;
     userId: string;
     token: string;
-    outcome: "success" | "failure";
+    // `denied` is the reuse verb's outcome (migration 0037): a refused request
+    // that also acted against the caller (it revoked the family), which a query
+    // for active attacks can filter on distinctly from a plain `failure`.
+    outcome: "success" | "failure" | "denied";
     /**
      * Defaults to 200 because every other caller here answers 200 — including
      * the refusals, which is the point of RFC 7662's `{active:false}` and RFC
@@ -826,6 +1235,16 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
     // was accepted when no legitimate caller depended on this route, and
     // gating it does not change who depends on it.
     const credential = await requireIntrospectionCredential(req);
+    // A real key refused by its IP policy (migration 0041): 403 with the
+    // generic body, and NOT recorded against the failed-lookup limiter, ahead
+    // of the invalid-credential branch below, mirroring the data plane. No
+    // audit row here: the policy module already wrote the throttled one.
+    if (!credential.ok && credential.reason === "ip_not_allowed") {
+      return res.status(403).json({
+        error: "access_denied",
+        error_description: CREDENTIAL_NOT_PERMITTED_MESSAGE,
+      });
+    }
     if (!credential.ok) {
       recordPublicOAuthEndpointFailure(req, "introspect");
       logger.info(
@@ -1123,7 +1542,9 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
         if (clientMismatch(tokenData.client_id)) {
           return refuseClientMismatch(tokenData, "refresh_token");
         }
-        await oauthRepository.deleteAccessToken(tokenData.access_token);
+        // The row is in hand from getByRefreshToken, so delete by its stored
+        // hash rather than re-hashing it through deleteAccessToken.
+        await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
         emitTokenLifecycle(req, {
           action: "oauth.token.revoke",
           clientId: tokenData.client_id,

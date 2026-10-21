@@ -16,9 +16,15 @@ import {
 } from "../../lib/metamcp/caller-context";
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
+import {
+  type CeilingEviction,
+  checkConcurrentSessionCeiling,
+  registerSessionCounter,
+} from "../../lib/metamcp/credential-session-quota";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { resolveSessionIdentity } from "../../lib/metamcp/session-auth";
 import { emitSessionBindingDenial } from "../../lib/metamcp/session-binding-denial";
+import { recordSessionCeilingEvent } from "../../lib/metamcp/session-ceiling-events";
 import {
   boundSessionMatches,
   classifyBindingDenial,
@@ -127,6 +133,17 @@ const sseRouter = express.Router();
 // Session lifetime manager for SSE sessions
 const sessionManager = new SessionLifetimeManagerImpl<Transport>("SSE");
 
+// Register as a source of live-session counts for the per-credential
+// concurrent-session ceiling, so a credential's budget spans SSE and
+// StreamableHTTP together rather than being counted separately per transport.
+//
+// Deliberately WITHOUT an eviction hook, and with no activity probe: an SSE
+// session is one open stream, so it is in use for as long as it exists and is
+// never idle in the sense the ceiling's eviction means. Its sessions are
+// therefore never chosen; a new SSE stream at the ceiling can still be
+// admitted by evicting the credential's idle StreamableHTTP session.
+registerSessionCounter(sessionManager);
+
 /**
  * Put a bound session into the module's REAL map — tests only. The
  * streamable-http twin is `recoverPersistedSession`, which tests can drive
@@ -190,11 +207,67 @@ sseRouter.get(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
-  async (req, res) => {
+  async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
     const { namespaceUuid, endpointName } = authReq;
+    // Enabled admissions reserve until registration, including free capacity.
+    // Disconnection and every failure release the reservation too.
+    let admissionEviction: CeilingEviction | undefined;
+    let releaseAdmission: (() => void) | undefined;
+    let admissionClosed = false;
+    const onAdmissionClose = () => {
+      if (!releaseAdmission) return;
+      admissionClosed = true;
+      releaseAdmission();
+    };
+    res.once("close", onAdmissionClose);
 
     try {
+      // Per-credential concurrent-session ceiling, enforced at creation: the
+      // same budget the StreamableHTTP path enforces, shared across both
+      // transports. Refuse before opening the stream so an over-budget
+      // credential cannot keep accreting sessions that starve the backend pool.
+      //
+      // The consumer's display name is resolved HERE, ahead of the ceiling
+      // check, so the WARN and the throttled gateway event can name WHICH
+      // credential is at the ceiling instead of emitting a nameless event. It
+      // is a read-only lookup and is reused for the caller stamp below, so
+      // moving it up costs nothing.
+      const clientIdentity = await resolveClientIdentity(authReq);
+      const identity = resolveSessionIdentity(authReq);
+      //
+      // `evictIdle`: at the ceiling, evict the credential's longest-idle
+      // StreamableHTTP session if it has one and admit; otherwise refuse
+      // exactly as before. See `checkConcurrentSessionCeiling`.
+      const ceiling = checkConcurrentSessionCeiling(identity, {
+        label: clientIdentity?.name,
+        evictIdle: true,
+      });
+      // Taken over before anything else can throw, so the `finally` owns the
+      // reserved slot from the moment the decision returns.
+      admissionEviction = ceiling.eviction;
+      releaseAdmission = ceiling.releaseAdmission;
+      if (res.destroyed) onAdmissionClose();
+      recordSessionCeilingEvent({
+        identity,
+        endpointName,
+        label: clientIdentity?.name,
+        decision: ceiling,
+      });
+      if (!ceiling.allowed) {
+        res.status(429).json({
+          error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
+        });
+        return;
+      }
+      if (admissionEviction) {
+        // The victim releases its pool state first, for at most
+        // EVICTION_ADMISSION_WAIT_MS (see the StreamableHTTP path). Never
+        // rejects.
+        await admissionEviction.teardownWait;
+      }
+      if (admissionClosed) return;
+
       logger.info(
         `New public endpoint SSE connection request for ${endpointName} -> namespace ${namespaceUuid}`,
       );
@@ -212,6 +285,13 @@ sseRouter.get(
         sessionId,
         namespaceUuid,
       );
+      if (admissionClosed) {
+        // The pool can complete after the client disconnects. It must never
+        // register a session that nobody owns, or consume the released slot.
+        await webAppTransport.close();
+        await metaMcpServerPool.cleanupSession(sessionId);
+        return;
+      }
       if (!mcpServerInstance) {
         throw new Error("Failed to get MetaMCP server instance from pool");
       }
@@ -225,7 +305,7 @@ sseRouter.get(
       // only — the authoritative per-request binding is entered on that leg
       // itself; this covers the window before the first message and any call
       // that reaches the auditing middleware outside a request scope.
-      const clientIdentity = await resolveClientIdentity(authReq);
+      // `clientIdentity` was resolved above for the ceiling check; reused here.
       stampCallerContext(
         mcpServerInstance.handlerContext,
         authReq,
@@ -241,6 +321,8 @@ sseRouter.get(
         webAppTransport,
         requestBinding(authReq),
       );
+      // Registration replaces the admission's reservation synchronously.
+      releaseAdmission?.();
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -253,7 +335,13 @@ sseRouter.get(
       await mcpServerInstance.server.connect(webAppTransport);
     } catch (error) {
       logger.error("Error in public endpoint /sse route:", error);
-      res.status(500).json(error);
+      // Constant body via the terminal error handler (middleware/error-handler)
+      // instead of serializing the raw error object to the client; it also
+      // destroys an already streaming SSE socket correctly.
+      return next(error);
+    } finally {
+      res.off("close", onAdmissionClose);
+      releaseAdmission?.();
     }
   },
 );
@@ -263,7 +351,7 @@ sseRouter.post(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
-  async (req, res) => {
+  async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
 
     try {
@@ -300,7 +388,9 @@ sseRouter.post(
       );
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);
-      res.status(500).json(error);
+      // Constant body via the terminal error handler instead of serializing
+      // the raw error object to the client.
+      return next(error);
     }
   },
 );

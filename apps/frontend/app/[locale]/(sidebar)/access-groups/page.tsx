@@ -37,6 +37,7 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import {
   Select,
   SelectContent,
@@ -54,33 +55,11 @@ import {
 } from "@/components/ui/table";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
+import { endpointGateState } from "@/lib/endpoint-gate-state";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 
 type CreateAccessGroupFormData = z.infer<typeof CreateAccessGroupRequestSchema>;
-
-/**
- * What a group's mapping onto one endpoint actually does today.
- *
- * `restricted` alone cannot say, and reporting it alone is wrong in the
- * reassuring direction. The gate governs OAUTH callers only, so:
- *
- *   off        the endpoint has not opted in; the mapping is legal and inert.
- *   noOauth    it opted in, but accepts no OAuth callers, so nothing is gated.
- *   oauthOnly  it gates OAuth callers, while every API-key holder still passes
- *              (the designed scope boundary, not a gap).
- *   enforcing  OAuth is the only way in and the gate governs all of it.
- */
-function endpointGateState(endpoint: {
-  restricted: boolean;
-  enable_oauth: boolean;
-  enable_api_key_auth: boolean;
-}): "off" | "noOauth" | "oauthOnly" | "enforcing" {
-  if (!endpoint.restricted) return "off";
-  if (!endpoint.enable_oauth) return "noOauth";
-  if (endpoint.enable_api_key_auth) return "oauthOnly";
-  return "enforcing";
-}
 
 /**
  * Access groups: which OAuth users may reach which endpoints (migration 0033).
@@ -254,135 +233,135 @@ export default function AccessGroupsPage() {
   );
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Users className="h-8 w-8 text-primary" />
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">
-              {t("access:groups.title")}
-            </h1>
-            <p className="text-muted-foreground">
-              {t("access:groups.description")}
-            </p>
-          </div>
-        </div>
+    <div className="space-y-6 min-w-0">
+      <PageHeader
+        icon={<Users className="h-8 w-8 text-primary" />}
+        title={t("access:groups.title")}
+        description={t("access:groups.description")}
+        actions={
+          <>
+            {!roleLoaded ? (
+              roleError ? (
+                <div className="flex flex-col items-end gap-1">
+                  <Button variant="outline" onClick={loadRole}>
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    {t("common:refresh")}
+                  </Button>
+                  <p className="text-xs text-destructive">
+                    {t("access:loadError")}
+                  </p>
+                </div>
+              ) : (
+                <Button disabled aria-busy="true">
+                  <Plus className="h-4 w-4 mr-2" />
+                  {t("access:groups.createGroup")}
+                </Button>
+              )
+            ) : !isAdmin ? (
+              <div className="flex flex-col items-end gap-1">
+                <Button disabled title={t("access:adminOnly")}>
+                  <Plus className="h-4 w-4 mr-2" />
+                  {t("access:groups.createGroup")}
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  {t("access:adminOnly")}
+                </p>
+              </div>
+            ) : (
+              <Dialog
+                open={createDialogOpen}
+                onOpenChange={(open) => {
+                  setCreateDialogOpen(open);
+                  if (!open) form.reset();
+                }}
+              >
+                <DialogTrigger asChild>
+                  <Button>
+                    <Plus className="h-4 w-4 mr-2" />
+                    {t("access:groups.createGroup")}
+                  </Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>{t("access:groups.createGroup")}</DialogTitle>
+                    <DialogDescription>
+                      {t("access:groups.createGroupDescription")}
+                    </DialogDescription>
+                  </DialogHeader>
 
-        {!roleLoaded ? (
-          roleError ? (
-            <div className="flex flex-col items-end gap-1">
-              <Button variant="outline" onClick={loadRole}>
-                <RefreshCw className="h-4 w-4 mr-2" />
-                {t("common:refresh")}
-              </Button>
-              <p className="text-xs text-destructive">
-                {t("access:loadError")}
-              </p>
-            </div>
-          ) : (
-            <Button disabled aria-busy="true">
-              <Plus className="h-4 w-4 mr-2" />
-              {t("access:groups.createGroup")}
-            </Button>
-          )
-        ) : !isAdmin ? (
-          <div className="flex flex-col items-end gap-1">
-            <Button disabled title={t("access:adminOnly")}>
-              <Plus className="h-4 w-4 mr-2" />
-              {t("access:groups.createGroup")}
-            </Button>
-            <p className="text-xs text-muted-foreground">
-              {t("access:adminOnly")}
-            </p>
-          </div>
-        ) : (
-          <Dialog
-            open={createDialogOpen}
-            onOpenChange={(open) => {
-              setCreateDialogOpen(open);
-              if (!open) form.reset();
-            }}
-          >
-            <DialogTrigger asChild>
-              <Button>
-                <Plus className="h-4 w-4 mr-2" />
-                {t("access:groups.createGroup")}
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>{t("access:groups.createGroup")}</DialogTitle>
-                <DialogDescription>
-                  {t("access:groups.createGroupDescription")}
-                </DialogDescription>
-              </DialogHeader>
-
-              <Form {...form}>
-                <form
-                  onSubmit={form.handleSubmit((data) =>
-                    createMutation.mutate({
-                      name: data.name.trim(),
-                      description: data.description?.trim() || undefined,
-                    }),
-                  )}
-                  className="space-y-4"
-                >
-                  <FormField
-                    control={form.control}
-                    name="name"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t("access:groups.nameLabel")}</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            placeholder={t("access:groups.namePlaceholder")}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          {t("access:groups.nameHelp")}
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="description"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>
-                          {t("access:groups.descriptionLabel")}
-                        </FormLabel>
-                        <FormControl>
-                          <Input {...field} value={field.value ?? ""} />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <div className="flex justify-end gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => setCreateDialogOpen(false)}
+                  <Form {...form}>
+                    <form
+                      onSubmit={form.handleSubmit((data) =>
+                        createMutation.mutate({
+                          name: data.name.trim(),
+                          description: data.description?.trim() || undefined,
+                        }),
+                      )}
+                      className="space-y-4"
                     >
-                      {t("common:cancel")}
-                    </Button>
-                    <Button type="submit" disabled={createMutation.isPending}>
-                      {createMutation.isPending
-                        ? t("access:groups.creating")
-                        : t("access:groups.create")}
-                    </Button>
-                  </div>
-                </form>
-              </Form>
-            </DialogContent>
-          </Dialog>
-        )}
-      </div>
+                      <FormField
+                        control={form.control}
+                        name="name"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t("access:groups.nameLabel")}
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                {...field}
+                                placeholder={t("access:groups.namePlaceholder")}
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              {t("access:groups.nameHelp")}
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+
+                      <FormField
+                        control={form.control}
+                        name="description"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t("access:groups.descriptionLabel")}
+                            </FormLabel>
+                            <FormControl>
+                              <Input {...field} value={field.value ?? ""} />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+
+                      <div className="flex justify-end gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => setCreateDialogOpen(false)}
+                        >
+                          {t("common:cancel")}
+                        </Button>
+                        <Button
+                          type="submit"
+                          disabled={createMutation.isPending}
+                        >
+                          {createMutation.isPending
+                            ? t("access:groups.creating")
+                            : t("access:groups.create")}
+                        </Button>
+                      </div>
+                    </form>
+                  </Form>
+                </DialogContent>
+              </Dialog>
+            )}
+          </>
+        }
+      />
 
       {roleLoaded && !isAdmin ? (
         <p className="text-sm text-muted-foreground">{t("access:adminOnly")}</p>

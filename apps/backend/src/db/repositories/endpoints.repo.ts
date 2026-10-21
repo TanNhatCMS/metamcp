@@ -19,6 +19,9 @@ export class EndpointsRepository {
         namespace_uuid: input.namespace_uuid,
         enable_api_key_auth: input.enable_api_key_auth ?? true,
         require_scoped_api_key: input.require_scoped_api_key ?? false,
+        // Persisted here so an endpoint can be created already-restricted; the
+        // create handler forces require_scoped_api_key on alongside it.
+        restricted: input.restricted ?? false,
         enable_max_rate: input.enable_max_rate ?? false,
         enable_client_max_rate: input.enable_client_max_rate ?? false,
         max_rate: input.max_rate,
@@ -141,6 +144,7 @@ export class EndpointsRepository {
           created_at: namespacesTable.created_at,
           updated_at: namespacesTable.updated_at,
           user_id: namespacesTable.user_id,
+          tool_policy: namespacesTable.tool_policy,
         },
       })
       .from(endpointsTable)
@@ -254,6 +258,7 @@ export class EndpointsRepository {
           created_at: namespacesTable.created_at,
           updated_at: namespacesTable.updated_at,
           user_id: namespacesTable.user_id,
+          tool_policy: namespacesTable.tool_policy,
         },
       })
       .from(endpointsTable)
@@ -332,6 +337,7 @@ export class EndpointsRepository {
           created_at: namespacesTable.created_at,
           updated_at: namespacesTable.updated_at,
           user_id: namespacesTable.user_id,
+          tool_policy: namespacesTable.tool_policy,
         },
       })
       .from(endpointsTable)

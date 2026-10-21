@@ -7,7 +7,7 @@
  * on. The hostnames below are all `example.com` subdomains for the same
  * reason — they must never resolve to anything real.
  *
- * `server.remote-url.test.ts` next door proves the route actually calls this;
+ * The `server.remote-url.test.ts` suite proves the route actually calls this;
  * a validator can be perfectly correct and still be wired to nothing.
  */
 
@@ -22,10 +22,19 @@ const {
   createGuardedFetch,
   createPinnedAgent,
   isBlockedSsrfAddress,
+  isInternalTarget,
+  GATEWAY_BACKEND_AUTH_HEADER,
+  CROSS_ORIGIN_REDIRECT_REFUSED,
+  MCP_URL_HAS_NO_HOST,
+  MCP_URL_NOT_PARSABLE,
+  MCP_URL_SCHEME_NOT_HTTP,
   NOT_A_PERMITTED_TARGET,
+  REDIRECT_TARGET_NOT_PARSABLE,
+  RESPONSE_TOO_LARGE,
   TOO_MANY_REDIRECTS,
   UNREPLAYABLE_REDIRECT_BODY,
 } = await import("./url-guard");
+const { default: logger } = await import("@/utils/logger");
 
 /** A routable public address, used wherever "somewhere on the internet" is the point. */
 const PUBLIC_V4 = "93.184.216.34";
@@ -191,12 +200,12 @@ describe("assertPublicMcpUrl — refusals", () => {
   ])("refuses the non-http(s) scheme in %s", async (url) => {
     await expect(
       assertPublicMcpUrl(url, { lookup: resolvesTo(PUBLIC_V4) }),
-    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+    ).rejects.toThrow(MCP_URL_SCHEME_NOT_HTTP);
   });
 
   it("refuses a URL that does not parse", async () => {
     await expect(assertPublicMcpUrl("not-a-url")).rejects.toThrow(
-      NOT_A_PERMITTED_TARGET,
+      MCP_URL_NOT_PARSABLE,
     );
   });
 
@@ -552,6 +561,154 @@ describe("assertPublicMcpUrl — the refusal is an oracle-free constant", () => 
   });
 });
 
+/**
+ * Every refusal names its real cause: in the message when the URL text alone
+ * decides it, and in the log line when the network does (where the message
+ * must stay the one oracle-free string above).
+ *
+ * The message used to blame a public-address rule for every refusal, which was
+ * wrong for the URL-text causes and for the pooled posture, where private
+ * ranges are allowed. Each case pins the exact message (equality, not the
+ * substring match `rejects.toThrow` does) and the reason the log carries.
+ */
+describe("assertPublicMcpUrl — each refusal names its real cause", () => {
+  const warn = vi.mocked(logger.warn);
+
+  beforeEach(() => {
+    warn.mockClear();
+  });
+
+  const refusalFor = async (
+    run: () => Promise<unknown>,
+  ): Promise<{ message: string; logged: string }> => {
+    try {
+      await run();
+    } catch (error) {
+      expect(warn).toHaveBeenCalledTimes(1);
+      return {
+        message: (error as Error).message,
+        logged: String(warn.mock.calls[0][0]),
+      };
+    }
+    throw new Error("expected a refusal");
+  };
+
+  const redirect = (location: string) =>
+    new Response(null, { status: 302, headers: { location } });
+
+  it.each([
+    {
+      cause: "a URL that does not parse",
+      run: () => assertPublicMcpUrl("not-a-url"),
+      message: MCP_URL_NOT_PARSABLE,
+      logged: "not a parsable absolute URL",
+    },
+    {
+      cause: "a non-http(s) scheme",
+      run: () =>
+        assertPublicMcpUrl("ftp://mcp.example.com/", {
+          lookup: resolvesTo(PUBLIC_V4),
+        }),
+      message: MCP_URL_SCHEME_NOT_HTTP,
+      logged: 'scheme "ftp:" is not http(s)',
+    },
+    {
+      cause: "a host that normalises to nothing",
+      // `URL` keeps "." as the hostname; the trailing-dot strip empties it.
+      run: () =>
+        assertPublicMcpUrl("http://./mcp", { lookup: resolvesTo(PUBLIC_V4) }),
+      message: MCP_URL_HAS_NO_HOST,
+      logged: "no host",
+    },
+    {
+      cause: "a redirect Location that does not parse",
+      run: () =>
+        createGuardedFetch({
+          baseFetch: vi.fn().mockResolvedValueOnce(redirect("http://[::1")),
+          lookup: resolvesTo(PUBLIC_V4),
+        })("https://mcp.example.com/mcp"),
+      message: REDIRECT_TARGET_NOT_PARSABLE,
+      logged: "redirect target is not a parsable URL",
+    },
+    {
+      cause: "a redirect to a non-http(s) scheme",
+      run: () =>
+        createGuardedFetch({
+          baseFetch: vi.fn().mockResolvedValueOnce(redirect("file:///etc/x")),
+          lookup: resolvesTo(PUBLIC_V4),
+        })("https://mcp.example.com/mcp"),
+      message: MCP_URL_SCHEME_NOT_HTTP,
+      logged: 'scheme "file:" is not http(s)',
+    },
+    {
+      cause: "a name that does not resolve",
+      run: () =>
+        assertPublicMcpUrl("https://mcp.example.com/sse", {
+          lookup: vi.fn(async () => {
+            throw new Error("ENOTFOUND");
+          }),
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"mcp.example.com" did not resolve',
+    },
+    {
+      cause: "a name that resolves to nothing",
+      run: () =>
+        assertPublicMcpUrl("https://mcp.example.com/sse", {
+          lookup: resolvesTo(),
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"mcp.example.com" resolved to nothing',
+    },
+    {
+      cause: "a name that resolves into a refused range",
+      run: () =>
+        assertPublicMcpUrl("https://mcp.example.com/sse", {
+          lookup: resolvesTo("10.0.0.5"),
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"mcp.example.com" resolves into 10.0.0.0/8',
+    },
+    {
+      cause: "an IP literal in a refused range",
+      run: () => assertPublicMcpUrl("http://169.254.169.254/latest/"),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"169.254.169.254" resolves into 169.254.0.0/16 link-local',
+    },
+    {
+      cause: "a pooled backend in CGNAT, where private ranges are allowed",
+      run: () =>
+        assertPublicMcpUrl("http://backend.internal/mcp", {
+          lookup: resolvesTo("100.64.0.1"),
+          allowPrivateAddresses: true,
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"backend.internal" resolves into 100.64.0.0/10',
+    },
+  ])("$cause", async ({ run, message, logged }) => {
+    const refusal = await refusalFor(run);
+
+    expect(refusal.message).toBe(message);
+    expect(refusal.logged).toContain(logged);
+  });
+
+  it("no longer blames a public-address rule for any refusal", async () => {
+    // The pooled posture permits private backends, so "must be reachable at a
+    // public address" is false there, and it was never the cause of a
+    // URL-text refusal.
+    for (const message of [
+      NOT_A_PERMITTED_TARGET,
+      MCP_URL_NOT_PARSABLE,
+      MCP_URL_SCHEME_NOT_HTTP,
+      MCP_URL_HAS_NO_HOST,
+      REDIRECT_TARGET_NOT_PARSABLE,
+    ]) {
+      expect(message).not.toMatch(/public/i);
+    }
+    expect(NOT_A_PERMITTED_TARGET).toContain("gateway log");
+  });
+});
+
 describe("createGuardedFetch — the connection is pinned to the validated address", () => {
   const ok = () => new Response("ok", { status: 200 });
 
@@ -709,5 +866,425 @@ describe("createGuardedFetch — every hop is re-validated, not just the first",
     );
     // Two connections happened; the third was refused before it was opened.
     expect(baseFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The pooled data plane's posture: internal backends are trusted (their DB
+ * rows are operator-configured), so private ranges are permitted while the
+ * cloud metadata address and the other never-a-backend ranges stay refused.
+ */
+describe("isBlockedSsrfAddress: allowPrivate relaxation", () => {
+  it.each([
+    ["10.1.2.3", "RFC 1918 ten-dot"],
+    ["172.16.0.1", "RFC 1918 one-seven-two"],
+    ["192.168.1.1", "RFC 1918 one-nine-two"],
+    ["127.0.0.1", "loopback"],
+    ["::1", "IPv6 loopback"],
+    ["fd12:3456::1", "IPv6 unique local"],
+    ["::ffff:10.0.0.1", "IPv4-mapped RFC 1918"],
+  ])("permits internal-service %s (%s) under allowPrivate", (address) => {
+    expect(isBlockedSsrfAddress(address, true)).toBeNull();
+  });
+
+  it.each([
+    ["169.254.169.254", "cloud metadata"],
+    ["100.64.0.1", "carrier-grade NAT"],
+    ["224.0.0.1", "multicast"],
+    ["0.0.0.0", "unspecified"],
+    ["::", "IPv6 unspecified"],
+    ["fe80::1", "IPv6 link-local"],
+    ["::ffff:169.254.169.254", "IPv4-mapped metadata"],
+  ])("still blocks %s (%s) under allowPrivate", (address) => {
+    expect(isBlockedSsrfAddress(address, true)).not.toBeNull();
+  });
+});
+
+describe("assertPublicMcpUrl: allowPrivateAddresses (pooled posture)", () => {
+  it("permits an internal RFC-1918 backend and still pins it", async () => {
+    const { url, addresses } = await assertPublicMcpUrl(
+      "http://backend.internal/mcp",
+      { lookup: resolvesTo("10.0.0.5"), allowPrivateAddresses: true },
+    );
+    expect(url.href).toBe("http://backend.internal/mcp");
+    // Non-empty addresses = the socket is pinned to the validated answer.
+    expect(addresses).toEqual(["10.0.0.5"]);
+  });
+
+  it("permits a loopback backend literal under allowPrivate", async () => {
+    const { addresses } = await assertPublicMcpUrl(
+      "http://127.0.0.1:3001/mcp",
+      {
+        allowPrivateAddresses: true,
+      },
+    );
+    expect(addresses).toEqual(["127.0.0.1"]);
+  });
+
+  it("still refuses the cloud metadata address under allowPrivate", async () => {
+    await expect(
+      assertPublicMcpUrl("http://backend.internal/mcp", {
+        lookup: resolvesTo("169.254.169.254"),
+        allowPrivateAddresses: true,
+      }),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+  });
+
+  it("still refuses CGNAT under allowPrivate", async () => {
+    await expect(
+      assertPublicMcpUrl("http://backend.internal/mcp", {
+        lookup: resolvesTo("100.64.0.1"),
+        allowPrivateAddresses: true,
+      }),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+  });
+});
+
+describe("createGuardedFetch: refuseCrossOriginRedirect (pooled posture)", () => {
+  const ok = () => new Response("ok", { status: 200 });
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+
+  it("refuses a cross-origin redirect outright rather than following it", async () => {
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirect(302, "https://elsewhere.example.com/x"))
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      refuseCrossOriginRedirect: true,
+    });
+
+    await expect(guarded("https://mcp.example.com/mcp")).rejects.toThrow(
+      CROSS_ORIGIN_REDIRECT_REFUSED,
+    );
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("still follows a same-origin redirect", async () => {
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirect(302, "https://mcp.example.com/mcp/"))
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      refuseCrossOriginRedirect: true,
+    });
+
+    const response = await guarded("https://mcp.example.com/mcp");
+    expect(response.status).toBe(200);
+    expect(baseFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("permits an internal backend but refuses its redirect to the metadata address", async () => {
+    // Together: allowPrivate lets hop 0 (an internal 10.x host) connect, and
+    // the cross-origin refusal stops the compromised-backend 302 to metadata.
+    // Without allowPrivate the first hop is refused and baseFetch is never
+    // called, so the single call also proves allowPrivate did its job.
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        redirect(302, "http://169.254.169.254/latest/meta-data/"),
+      )
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo("10.0.0.5"),
+      allowPrivateAddresses: true,
+      refuseCrossOriginRedirect: true,
+    });
+
+    await expect(guarded("http://backend.internal/mcp")).rejects.toThrow(
+      CROSS_ORIGIN_REDIRECT_REFUSED,
+    );
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createGuardedFetch: the response body is bounded", () => {
+  it("aborts a response body that exceeds the byte ceiling", async () => {
+    const baseFetch = vi.fn(async () => new Response("abcdefgh")); // 8 bytes
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      maxResponseBytes: 4,
+    });
+
+    const response = await guarded("https://mcp.example.com/mcp");
+    await expect(response.text()).rejects.toThrow(RESPONSE_TOO_LARGE);
+  });
+
+  it("passes a response under the byte ceiling untouched", async () => {
+    const baseFetch = vi.fn(async () => new Response("ok"));
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      maxResponseBytes: 1024,
+    });
+
+    const response = await guarded("https://mcp.example.com/mcp");
+    expect(await response.text()).toBe("ok");
+  });
+});
+
+describe("isInternalTarget", () => {
+  const target = (addresses: string[]) => ({
+    url: new URL("http://backend.example/mcp"),
+    addresses,
+  });
+
+  it("classifies an allowlisted (empty-address, trusted-by-name) target as internal", () => {
+    expect(isInternalTarget(target([]))).toBe(true);
+  });
+
+  it("classifies an all-internal-service address set as internal", () => {
+    expect(isInternalTarget(target(["10.0.0.5", "127.0.0.1"]))).toBe(true);
+  });
+
+  it("classifies a public address as external", () => {
+    expect(isInternalTarget(target([PUBLIC_V4]))).toBe(false);
+  });
+
+  it("classifies the cloud metadata address as external (never a trust-header target)", () => {
+    // Blocked under both postures, so it is neither an internal service nor
+    // public: the trust header must never reach it.
+    expect(isInternalTarget(target(["169.254.169.254"]))).toBe(false);
+  });
+
+  it("classifies a mixed internal + public set as external", () => {
+    // One public answer in a rebinding-style set means the header must not go.
+    expect(isInternalTarget(target(["10.0.0.5", PUBLIC_V4]))).toBe(false);
+  });
+});
+
+describe("createGuardedFetch: the gateway backend trust header", () => {
+  const ok = () => new Response("ok", { status: 200 });
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+  const SECRET = "g".repeat(32);
+  const ORIGINAL_SECRET = process.env.GATEWAY_BACKEND_SECRET;
+
+  afterEach(() => {
+    if (ORIGINAL_SECRET === undefined) {
+      delete process.env.GATEWAY_BACKEND_SECRET;
+    } else {
+      process.env.GATEWAY_BACKEND_SECRET = ORIGINAL_SECRET;
+    }
+  });
+
+  // The exact posture createPoolGuardedFetch hands to BOTH the SSE and the
+  // Streamable-HTTP transport, so a header decision proven here holds for both.
+  const poolGuard = (
+    baseFetch: (url: string | URL, init?: RequestInit) => Promise<Response>,
+    lookup: (hostname: string) => Promise<string[]>,
+  ) =>
+    createGuardedFetch({
+      baseFetch,
+      lookup,
+      allowPrivateAddresses: true,
+      refuseCrossOriginRedirect: true,
+    });
+
+  const sentHeaders = (baseFetch: { mock: { calls: unknown[][] } }, call = 0) =>
+    (baseFetch.mock.calls[call][1] as { headers: Headers }).headers;
+
+  it("stamps the header on an internal destination when the secret is set", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp", {
+      headers: { authorization: "Bearer row-token" },
+    });
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+    // The row's own credential is left untouched beside it.
+    expect(sentHeaders(baseFetch).get("authorization")).toBe(
+      "Bearer row-token",
+    );
+  });
+
+  it("does NOT stamp the header on a public (non-internal) destination", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo(PUBLIC_V4));
+
+    await guarded("https://mcp.example.com/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("sends nothing when the secret is unset, even to an internal destination", async () => {
+    delete process.env.GATEWAY_BACKEND_SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("treats a secret shorter than 32 bytes as unset (fail closed)", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = "short";
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("strips a forged inbound trust header before reaching a public destination", async () => {
+    // A server row's stored headers must never smuggle the header to an
+    // external server, whether or not a real secret is configured.
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo(PUBLIC_V4));
+
+    await guarded("https://mcp.example.com/mcp", {
+      headers: { [GATEWAY_BACKEND_AUTH_HEADER]: "attacker-supplied" },
+    });
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("overwrites a forged inbound value with the real secret on an internal destination", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp", {
+      headers: { [GATEWAY_BACKEND_AUTH_HEADER]: "attacker-supplied" },
+    });
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+  });
+
+  it("stamps the header for an allowlisted, trusted-by-name internal host (Inspector path)", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    // Inspector posture: strict range check, host trusted by the allowlist so
+    // it is never resolved (addresses = []), which classifies it internal.
+    const guarded = createGuardedFetch({
+      baseFetch,
+      allowedHosts: ["host.docker.internal"],
+      allowlistOrigin: "http://host.docker.internal",
+    });
+
+    await guarded("http://host.docker.internal/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+  });
+
+  it("does not carry the header from an internal hop 0 onto a public redirect hop", async () => {
+    // Inspector posture follows a cross-origin redirect with credentials
+    // dropped; the internal hop-0 stamp must not ride along to the public hop.
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirect(302, "https://mcp.example.com/next"))
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      allowedHosts: ["host.docker.internal"],
+      allowlistOrigin: "http://host.docker.internal",
+      lookup: resolvesTo(PUBLIC_V4),
+    });
+
+    await guarded("http://host.docker.internal/mcp");
+
+    expect(sentHeaders(baseFetch, 0).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+    expect(
+      sentHeaders(baseFetch, 1).get(GATEWAY_BACKEND_AUTH_HEADER),
+    ).toBeNull();
+  });
+
+  it("never logs the secret value", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const logger = (await import("@/utils/logger")).default as unknown as {
+      info: ReturnType<typeof vi.fn>;
+      warn: ReturnType<typeof vi.fn>;
+      error: ReturnType<typeof vi.fn>;
+      debug: ReturnType<typeof vi.fn>;
+    };
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp", {
+      headers: { authorization: "Bearer row-token" },
+    });
+
+    const everyLoggedArg = [
+      ...logger.info.mock.calls,
+      ...logger.warn.mock.calls,
+      ...logger.error.mock.calls,
+      ...logger.debug.mock.calls,
+    ]
+      .flat()
+      .map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg)))
+      .join(" ");
+    expect(everyLoggedArg).not.toContain(SECRET);
+  });
+});
+
+describe("warnIfGatewayBackendSecretUnset", () => {
+  const ORIGINAL_SECRET = process.env.GATEWAY_BACKEND_SECRET;
+
+  afterEach(() => {
+    if (ORIGINAL_SECRET === undefined) {
+      delete process.env.GATEWAY_BACKEND_SECRET;
+    } else {
+      process.env.GATEWAY_BACKEND_SECRET = ORIGINAL_SECRET;
+    }
+    vi.resetModules();
+  });
+
+  // A fresh module per case so the one-shot boot latch starts down. The mocked
+  // logger is a singleton that survives resetModules (mock registrations do),
+  // so its call count is cleared explicitly rather than relying on the reset.
+  const freshBootWarn = async () => {
+    vi.resetModules();
+    const mod = await import("./url-guard");
+    const logger = (await import("@/utils/logger")).default as unknown as {
+      warn: ReturnType<typeof vi.fn>;
+    };
+    logger.warn.mockClear();
+    return { warn: mod.warnIfGatewayBackendSecretUnset, logger };
+  };
+
+  it("warns exactly once when the secret is unset", async () => {
+    delete process.env.GATEWAY_BACKEND_SECRET;
+    const { warn, logger } = await freshBootWarn();
+    warn();
+    warn();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toContain(
+      "GATEWAY_BACKEND_SECRET is not set",
+    );
+  });
+
+  it("warns that a too-short secret is ignored", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = "too-short";
+    const { warn, logger } = await freshBootWarn();
+    warn();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toContain("shorter than 32 bytes");
+  });
+
+  it("stays silent when a valid secret is set", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = "g".repeat(32);
+    const { warn, logger } = await freshBootWarn();
+    warn();
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 });

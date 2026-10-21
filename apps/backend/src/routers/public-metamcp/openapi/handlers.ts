@@ -19,6 +19,7 @@ import { createAuditingMiddleware } from "../../../lib/metamcp/metamcp-middlewar
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
+  type ToolFilterCallContext,
 } from "../../../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   CallToolHandler,
@@ -26,11 +27,16 @@ import {
   ListToolsHandler,
   MetaMCPHandlerContext,
 } from "../../../lib/metamcp/metamcp-middleware/functional-middleware";
+import { createRetiredToolMiddleware } from "../../../lib/metamcp/metamcp-middleware/retired-tool.functional";
+import { createTimeoutHintMiddleware } from "../../../lib/metamcp/metamcp-middleware/timeout-hint.functional";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
 } from "../../../lib/metamcp/metamcp-middleware/tool-overrides.functional";
-import { isRecoverableBackendError } from "../../../lib/metamcp/session-error";
+import {
+  isRecoverableBackendError,
+  isToolCallReplaySafeError,
+} from "../../../lib/metamcp/session-error";
 import { acquireSessionWithBoundedWarmup } from "../../../lib/metamcp/tool-call-warmup";
 import { sanitizeName } from "../../../lib/metamcp/utils";
 
@@ -75,6 +81,16 @@ export const createOriginalListToolsHandler = (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+
+        // This prefix must round-trip through the first-'__' call parser,
+        // otherwise curation would judge a different server and backend name.
+        if (sanitizeName(serverName).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
+          );
+          failedServers.push(serverName || mcpServerUuid);
+          return;
+        }
 
         // Get configurable timeout values to bypass MCP SDK default enforcement
         const resetTimeoutOnProgress =
@@ -174,22 +190,30 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
   const toolToServerUuid: Record<string, string> = {};
 
   return async (request, context) => {
+    // `name` is the caller-controlled tool name (a URL-decoded path segment on
+    // the OpenAPI path). Every log line and thrown message below runs it
+    // through JSON.stringify so an embedded CR/LF cannot forge log lines, the
+    // same discipline as the mcp-proxy connection log.
     const { name, arguments: args } = request.params;
 
     // Extract the original tool name by removing the server prefix
     const firstDoubleUnderscoreIndex = name.indexOf("__");
     if (firstDoubleUnderscoreIndex === -1) {
-      throw new Error(`Invalid tool name format: ${name}`);
+      throw new Error(`Invalid tool name format: ${JSON.stringify(name)}`);
     }
 
     const serverPrefix = name.substring(0, firstDoubleUnderscoreIndex);
     const originalToolName = name.substring(firstDoubleUnderscoreIndex + 2);
+    const { allowedToolServerUuids } = context as ToolFilterCallContext;
+    const isAllowedServer = (uuid: string): boolean =>
+      !allowedToolServerUuids || allowedToolServerUuids.includes(uuid);
 
     // Get server parameters and find the right session for this tool
     const serverParams = await getMcpServers(context.namespaceUuid);
     let targetSession = null;
 
     for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
+      if (!isAllowedServer(mcpServerUuid)) continue;
       const session = await mcpServerPool.getSession(
         context.sessionId,
         mcpServerUuid,
@@ -229,7 +253,9 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     // a live session, then give that one server a short, bounded
     // chance to come back. Skip the wait entirely when the DB has no
     // record of this tool — that's genuinely unknown, not a reconnect
-    // race, and must still 404 immediately.
+    // race, and must still 404 immediately. ACTIVE mapping rows only (see
+    // findServersForNamespaceToolName), as in metamcp-proxy.ts, so this
+    // never routes a server the tool filter would refuse for this tool.
     if (!targetSession) {
       const candidates =
         await namespacesRepository.findServersForNamespaceToolName(
@@ -238,6 +264,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         );
       const match = candidates.find(
         (candidate) =>
+          isAllowedServer(candidate.serverUuid) &&
           sanitizeName(candidate.serverName || "") === serverPrefix,
       );
       const paramsForMatch = match ? serverParams[match.serverUuid] : undefined;
@@ -269,7 +296,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     }
 
     if (!targetSession) {
-      throw new Error(`Unknown tool: ${name}`);
+      throw new Error(`Unknown tool: ${JSON.stringify(name)}`);
     }
 
     const targetServerUuid = toolToServerUuid[name];
@@ -318,9 +345,19 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       // session via the pool, retry once. Logs are tagged "OpenAPI
       // bridge" so operators can split this recovery from the
       // Streamable-HTTP one when investigating.
-      if (!isRecoverableBackendError(error)) {
+      //
+      // The retry is gated on isToolCallReplaySafeError, NOT the
+      // isRecoverableBackendError the tools/list path above uses: a
+      // tools/call is replayed only when the failure proves the backend
+      // never ran it (HTTP 404 "Session not found", or a transport closed
+      // before the send). A timeout, a mid-call drop or a 5xx surfaces
+      // with no replay, because the backend may already have executed a
+      // non-idempotent tool and a second send runs it twice. Found while
+      // investigating the 2026-09-30 client-side duplicate; same rule as
+      // metamcp-proxy.ts.
+      if (!isToolCallReplaySafeError(error)) {
         logger.error(
-          `Error calling tool "${name}" through ${
+          `Error calling tool ${JSON.stringify(name)} through ${
             targetSession.client.getServerVersion()?.name || "unknown"
           }:`,
           error,
@@ -329,7 +366,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       }
 
       logger.warn(
-        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool ${JSON.stringify(name)}; invalidating pool and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
@@ -368,7 +405,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         return (await callOnce(freshSession)) as CallToolResult;
       } catch (retryError) {
         logger.error(
-          `OpenAPI bridge: error calling tool "${name}" through ${
+          `OpenAPI bridge: error calling tool ${JSON.stringify(name)} through ${
             freshSession.client.getServerVersion()?.name || "unknown"
           } after session re-initialize:`,
           retryError,
@@ -431,12 +468,31 @@ export const createMiddlewareEnabledHandlers = (
     // servers with the same credentials, so both have to be recorded the same
     // way for retention on this table to mean anything.
     createAuditingMiddleware(),
+    // Second, outside the filter, as in the Streamable-HTTP chain: a call that
+    // already failed as an unknown tool gets the retired-tool map's answer.
+    // The bridge routes by server prefix only, so a retired name on a live
+    // server reaches the backend and comes back as an isError "Unknown tool";
+    // this turns that into a redirect (surfaced as the bridge's usual 403 body).
+    createRetiredToolMiddleware(),
+    // Override names resolve BEFORE the filter, so the filter judges the tool
+    // that will actually run: the same order as the Streamable-HTTP chain in
+    // metamcp-proxy (fork #208). This chain still had the filter outside, so
+    // a call by an alias reached the filter as the alias, which has no
+    // mapping row of its own. Under `allow_all` that read as "no row,
+    // allowed" and an INACTIVE tool stayed callable by its alias; under the
+    // `allowlist` tool policy (migration 0040) it would read as "no row,
+    // refused" and every alias of an allowlisted tool would be refused. A
+    // name that is not an override passes the override middleware unchanged.
+    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>
         `Access denied to tool "${toolName}": ${reason}`,
     }),
-    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
+    // Innermost: added text on the gateway's own -32001 timeout (the outcome is
+    // unknown, read the target's state before retrying), same code and data. The bridge
+    // maps a thrown error to a 500 whose message carries it.
+    createTimeoutHintMiddleware(),
     // Add more middleware here as needed
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);

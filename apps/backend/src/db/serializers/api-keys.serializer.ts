@@ -1,3 +1,5 @@
+import { readMode } from "../../lib/api-key-ip-policy";
+
 export class ApiKeysSerializer {
   // The one display rule every key surface shares, so they can never drift
   // apart into "one of them still leaks". Since migration 0034 the key is not
@@ -113,6 +115,10 @@ export class ApiKeysSerializer {
       acts_as_user_id: string | null;
       acts_as_email: string | null;
       owner_email: string | null;
+      admin_plane: boolean;
+      allowed_cidrs: string[] | null;
+      ip_policy_mode: string;
+      last_used_ip: string | null;
     }>,
   ) {
     return dbApiKeys.map((apiKey) => ({
@@ -124,9 +130,40 @@ export class ApiKeysSerializer {
       endpoint_uuid: apiKey.endpoint_uuid,
       acts_as_user_id: apiKey.acts_as_user_id,
       acts_as_email: apiKey.acts_as_email,
+      // Plane flag (migration 0038): a boolean, never credential material, so
+      // it is safe in a list. Labels a control-plane key in the admin view.
+      admin_plane: apiKey.admin_plane,
       created_at: apiKey.created_at,
       last_used_at: apiKey.last_used_at,
       is_active: apiKey.is_active,
+      // IP allowlist (migration 0041). The mode is read through readMode so a
+      // value outside the enum (impossible past the CHECK, but this is the
+      // .output() boundary) is shown the way the evaluator reads it.
+      allowed_cidrs: apiKey.allowed_cidrs,
+      ip_policy_mode: readMode(apiKey.ip_policy_mode),
+      last_used_ip: apiKey.last_used_ip,
     }));
+  }
+
+  // Readback for apiKeys.setIpPolicy: the stored policy (canonical CIDRs) plus
+  // the identifying fields, never credential material.
+  static serializeApiKeyIpPolicy(dbApiKey: {
+    uuid: string;
+    name: string;
+    last4: string;
+    is_active: boolean;
+    allowed_cidrs: string[] | null;
+    ip_policy_mode: string;
+    last_used_ip: string | null;
+  }) {
+    return {
+      uuid: dbApiKey.uuid,
+      name: dbApiKey.name,
+      key_prefix: ApiKeysSerializer.keyPrefix(dbApiKey.last4),
+      is_active: dbApiKey.is_active,
+      allowed_cidrs: dbApiKey.allowed_cidrs,
+      ip_policy_mode: readMode(dbApiKey.ip_policy_mode),
+      last_used_ip: dbApiKey.last_used_ip,
+    };
   }
 }

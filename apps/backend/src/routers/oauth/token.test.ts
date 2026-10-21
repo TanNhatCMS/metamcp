@@ -35,11 +35,21 @@ vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 const oauthRepositoryMock = {
   getAuthCode: vi.fn(),
   deleteAuthCode: vi.fn(),
+  consumeAuthCode: vi.fn(),
   getClient: vi.fn(),
   getByRefreshToken: vi.fn(),
   setAccessToken: vi.fn(),
   deleteAccessToken: vi.fn(),
+  // Rotation and refresh-expiry paths delete by the stored hash (migration
+  // 0036), since they already hold the row read by refresh token.
+  deleteAccessTokenByHash: vi.fn(),
   getAccessToken: vi.fn(),
+  // Refresh-token family reuse detection (migration 0037): rotation records the
+  // outgoing token, and a presented token that is not live is checked against
+  // the rotated markers before it is rejected.
+  recordRotatedRefreshToken: vi.fn(),
+  getRotatedRefreshToken: vi.fn(),
+  revokeFamily: vi.fn(),
 };
 
 const usersRepositoryMock = {
@@ -63,6 +73,10 @@ vi.mock("./introspection-auth", () => ({
 }));
 
 const { default: tokenRouter } = await import("./token");
+// Dynamic import for the same reason the router is imported this way: a static
+// import of ./utils pulls @/utils/logger into the module graph during the
+// import phase, before the hoisted vi.mock factory's loggerMock is initialized.
+const { hashClientSecret } = await import("./utils");
 
 const CLIENT_ID = "mcp_client_test";
 const USER_ID = "user-abc123";
@@ -181,7 +195,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   oauthRepositoryMock.setAccessToken.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
+  // Default: the atomic single-use delete removed the row (this caller won the
+  // race). Tests that exercise the loser set their own answer.
+  oauthRepositoryMock.consumeAuthCode.mockResolvedValue(true);
   oauthRepositoryMock.deleteAccessToken.mockResolvedValue(undefined);
+  oauthRepositoryMock.deleteAccessTokenByHash.mockResolvedValue(undefined);
   // Default: the account is live. Tests that care set their own answer, so a
   // disabled-enforcement test that forgot to arm the mock fails OPEN and its
   // own assertion catches it.
@@ -292,6 +310,8 @@ describe("POST /oauth/token — refresh_token success logging", () => {
       scope: SCOPE,
       expires_at: new Date(Date.now() + 60 * 1000),
       refresh_token_expires_at: new Date(Date.now() + 365 * 24 * 3600 * 1000),
+      // The rotated row's family (migration 0037); the new pair inherits it.
+      family_id: "11111111-1111-1111-1111-111111111111",
     });
   });
 
@@ -450,7 +470,11 @@ describe("POST /oauth/token — disabled account is refused on both grants", () 
 
     await exchange();
 
+    // The disabled check sits before the single-use consumption, so neither the
+    // cleanup delete nor the atomic consume runs — re-enabling the account
+    // inside the code's TTL restores a working flow rather than a burnt code.
     expect(oauthRepositoryMock.deleteAuthCode).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.consumeAuthCode).not.toHaveBeenCalled();
   });
 
   it("logs reason=disabled naming the grant and user, and no credential", async () => {
@@ -551,5 +575,269 @@ describe("POST /oauth/token — failure paths stay silent", () => {
 
     expect(res.statusCode).toBe(400);
     expect(allLoggedText()).not.toContain("[oauth] token issued");
+  });
+});
+
+describe("POST /oauth/token — PKCE method must be S256", () => {
+  const authCode = "mcp_code_plainmethodcode0000";
+
+  beforeEach(() => {
+    // A stored code recording the "plain" method. The authorize handler no
+    // longer mints one, so this stands in for a legacy row; the token endpoint
+    // must refuse it rather than verify it.
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: authCode,
+      client_id: CLIENT_ID,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      scope: SCOPE,
+      user_id: USER_ID,
+      code_challenge: "some-plain-challenge",
+      code_challenge_method: "plain",
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+    });
+    oauthRepositoryMock.getClient.mockResolvedValue({
+      client_id: CLIENT_ID,
+      client_name: "Claude",
+      token_endpoint_auth_method: "none",
+      client_secret: null,
+    });
+  });
+
+  it("refuses a plain-method code with invalid_grant and mints nothing", async () => {
+    const res = await post({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      client_id: CLIENT_ID,
+      code_verifier: "some-plain-challenge",
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_grant");
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /oauth/token — client secret compared in constant time", () => {
+  const authCode = "mcp_code_clientsecretcode000";
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  const RIGHT_SECRET = "mcp_secret_the_real_one_012345";
+  const WRONG_SECRET = "mcp_secret_a_different_one_678";
+
+  const codeRow = () => ({
+    code: authCode,
+    client_id: CLIENT_ID,
+    redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+    scope: SCOPE,
+    user_id: USER_ID,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+    expires_at: new Date(Date.now() + 10 * 60 * 1000),
+  });
+
+  // getClient returns the salted hash at rest (migration 0036), not the
+  // plaintext, so the row carries the digest of RIGHT_SECRET and its salt,
+  // exactly what verifyClientSecret recomputes the presented secret against.
+  const rightHashed = hashClientSecret(RIGHT_SECRET);
+  const clientRow = (method: string) => ({
+    client_id: CLIENT_ID,
+    client_name: "Confidential Client",
+    token_endpoint_auth_method: method,
+    client_secret: rightHashed.hash,
+    client_secret_salt: rightHashed.salt,
+  });
+
+  function postWithAuth(
+    body: Record<string, unknown>,
+    authorization?: string,
+  ): Promise<FakeRes> {
+    ipCounter += 1;
+    const req = {
+      method: "POST",
+      url: "/oauth/token",
+      originalUrl: "/oauth/token",
+      baseUrl: "",
+      body,
+      headers: authorization ? { authorization } : {},
+      ip: `10.0.9.${ipCounter}`,
+      socket: { remoteAddress: `10.0.9.${ipCounter}` },
+    } as unknown as express.Request;
+    const res = makeRes();
+    return new Promise<FakeRes>((resolve, reject) => {
+      (tokenRouter as unknown as express.RequestHandler)(
+        req,
+        res as unknown as express.Response,
+        (err?: unknown) => (err ? reject(err) : resolve(res)),
+      );
+      res.settled.then(() => resolve(res));
+    });
+  }
+
+  const basicHeader = (secret: string) =>
+    `Basic ${Buffer.from(`${CLIENT_ID}:${secret}`).toString("base64")}`;
+
+  beforeEach(() => {
+    oauthRepositoryMock.getAuthCode.mockResolvedValue(codeRow());
+  });
+
+  it("client_secret_post: right secret passes, wrong secret is refused", async () => {
+    oauthRepositoryMock.getClient.mockResolvedValue(
+      clientRow("client_secret_post"),
+    );
+
+    const ok = await post({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      client_id: CLIENT_ID,
+      code_verifier: codeVerifier,
+      client_secret: RIGHT_SECRET,
+    });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.body?.access_token).toMatch(/^mcp_token_/);
+
+    oauthRepositoryMock.getAuthCode.mockResolvedValue(codeRow());
+    const bad = await post({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      client_id: CLIENT_ID,
+      code_verifier: codeVerifier,
+      client_secret: WRONG_SECRET,
+    });
+    expect(bad.statusCode).toBe(401);
+    expect(bad.body?.error).toBe("invalid_client");
+  });
+
+  it("client_secret_basic: right secret passes, wrong secret is refused", async () => {
+    oauthRepositoryMock.getClient.mockResolvedValue(
+      clientRow("client_secret_basic"),
+    );
+
+    const ok = await postWithAuth(
+      {
+        grant_type: "authorization_code",
+        code: authCode,
+        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+        client_id: CLIENT_ID,
+        code_verifier: codeVerifier,
+      },
+      basicHeader(RIGHT_SECRET),
+    );
+    expect(ok.statusCode).toBe(200);
+    expect(ok.body?.access_token).toMatch(/^mcp_token_/);
+
+    oauthRepositoryMock.getAuthCode.mockResolvedValue(codeRow());
+    const bad = await postWithAuth(
+      {
+        grant_type: "authorization_code",
+        code: authCode,
+        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+        client_id: CLIENT_ID,
+        code_verifier: codeVerifier,
+      },
+      basicHeader(WRONG_SECRET),
+    );
+    expect(bad.statusCode).toBe(401);
+    expect(bad.body?.error).toBe("invalid_client");
+  });
+});
+
+describe("POST /oauth/token — authorization code is single-use under concurrency", () => {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  const authCode = "mcp_code_concurrentredeem000";
+
+  beforeEach(() => {
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: authCode,
+      client_id: CLIENT_ID,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      scope: SCOPE,
+      user_id: USER_ID,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+    });
+    oauthRepositoryMock.getClient.mockResolvedValue({
+      client_id: CLIENT_ID,
+      client_name: "Claude",
+      token_endpoint_auth_method: "none",
+      client_secret: null,
+    });
+  });
+
+  const exchange = () =>
+    post({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      client_id: CLIENT_ID,
+      code_verifier: codeVerifier,
+    });
+
+  it("issues exactly one token pair when two requests redeem the same code", async () => {
+    // The atomic consume is the gate: only one DELETE ... RETURNING removes the
+    // row, so only one caller may proceed. Modelled by consumeAuthCode winning
+    // once and losing every time after.
+    oauthRepositoryMock.consumeAuthCode.mockReset();
+    oauthRepositoryMock.consumeAuthCode
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(false);
+
+    const results = await Promise.all([exchange(), exchange()]);
+    const statuses = results.map((r) => r.statusCode).sort();
+
+    expect(statuses).toEqual([200, 400]);
+    const winner = results.find((r) => r.statusCode === 200);
+    const loser = results.find((r) => r.statusCode === 400);
+    expect(winner?.body?.access_token).toMatch(/^mcp_token_/);
+    expect(loser?.body?.error).toBe("invalid_grant");
+    expect(oauthRepositoryMock.setAccessToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses invalid_grant when the code was already consumed", async () => {
+    oauthRepositoryMock.consumeAuthCode.mockReset();
+    oauthRepositoryMock.consumeAuthCode.mockResolvedValue(false);
+
+    const res = await exchange();
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_grant");
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /oauth/token — refresh token with no expiry is refused", () => {
+  const refreshToken = "mcp_refresh_nullexpiry0000000";
+
+  it("treats a NULL refresh expiry as expired, not as valid forever", async () => {
+    // The never-reaped shape (see migration 0035). The refresh grant used
+    // to skip the expiry check when the value was NULL and mint a fresh access
+    // token; it must now refuse and mint nothing.
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue({
+      access_token: "mcp_token_previouslyissued0000",
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      expires_at: new Date(Date.now() + 60 * 1000),
+      refresh_token_expires_at: null,
+    });
+
+    const res = await post({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_grant");
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
   });
 });

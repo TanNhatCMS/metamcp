@@ -23,7 +23,7 @@
     "db:migrate:dev": "dotenv -e ../../.env.local -- drizzle-kit migrate"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "@repo/trpc": "workspace:*",
     "@repo/zod-types": "workspace:*",
     "@trpc/server": "^11.18.0",
@@ -33,6 +33,7 @@
     "cross-spawn": "^7.0.6",
     "dotenv": "^16.6.1",
     "drizzle-orm": "^0.45.2",
+    "drizzle-kit": "^0.31.10",
     "execa": "^9.6.1",
     "express": "^5.2.1",
     "helmet": "^8.3.0",
@@ -52,14 +53,13 @@
     "@types/node": "^20.19.43",
     "@types/pg": "^8.20.3",
     "@types/shell-quote": "^1.7.5",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^4.1.11",
     "dotenv-cli": "^8.0.0",
-    "drizzle-kit": "^0.31.10",
     "eslint": "^9.39.5",
     "tsup": "^8.5.1",
     "tsx": "^4.23.5",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "keywords": [],
   "author": "",

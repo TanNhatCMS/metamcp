@@ -40,6 +40,11 @@ export const createMcpServersRouter = (
       userId: string,
       isAdmin: boolean,
     ) => Promise<z.infer<typeof ListMcpServersResponseSchema>>;
+    // Every server regardless of owner; the caller id preserves credential
+    // redaction on another owner's private rows even in this admin inventory.
+    listAll: (
+      userId: string,
+    ) => Promise<z.infer<typeof ListMcpServersResponseSchema>>;
     bulkImport: (
       input: z.infer<typeof BulkImportMcpServersRequestSchema>,
       userId: string,
@@ -89,6 +94,18 @@ export const createMcpServersRouter = (
           ctx.user.id,
           ctx.user.role === "admin",
         );
+      }),
+
+    // Admin only: every server, whoever owns it, each row carrying its owner
+    // in `user_id` (null = public). Deliberately NOT an admin branch inside
+    // `list`: the platform's CI config sync matches servers by NAME over
+    // `list`, and a private row owned by another user that shares a synced
+    // server's name would become a match it could overwrite. `list` keeps its
+    // public-plus-own result for every caller, admins included.
+    listAll: adminProcedure
+      .output(ListMcpServersResponseSchema)
+      .query(async ({ ctx }) => {
+        return await implementations.listAll(ctx.user.id);
       }),
 
     // Protected: Get single MCP server by UUID — same contract as `list`.

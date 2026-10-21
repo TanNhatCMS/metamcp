@@ -74,7 +74,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 ### Session survival across restarts
 
-- **Session-lost and transport-lost recovery** — detectors that recognize the many wrap shapes of a dead backend session (`-32600 "Session not found"`) or a dead transport (`"Not connected"`), walking `.cause` chains and nested envelopes, wired into every proxy call site (tools/call, dynamic-find, aggregate list handlers, and the OpenAPI bridge). Recovery invalidates the stale pooled connection and retries once, transparently.
+- **Session-lost and transport-lost recovery** — detectors that recognize the many wrap shapes of a dead backend session (`-32600 "Session not found"`) or a dead transport (`"Not connected"`), walking `.cause` chains and nested envelopes, wired into every proxy call site (tools/call, dynamic-find, aggregate list handlers, and the OpenAPI bridge). Recovery invalidates the stale pooled connection and retries once, transparently. A tool call is retried only when the failure proves the backend never ran it (an HTTP 404 "Session not found" answer, or a transport closed before the send); a timeout or a connection dropped mid-call reaches the client instead, so the gateway does not re-send a call that may already have executed.
 - **Lazy session recovery across gateway restarts** — session metadata is persisted to an `mcp_sessions` table on init (session id, namespace, endpoint, hashed auth principal, init params). After the gateway restarts with an empty in-memory pool, a returning client's cached `Mcp-Session-Id` is re-validated against the table in constant time, the transport is rebuilt, and the request is replayed — including replaying the MCP `initialize` handshake so the rebuilt transport is actually usable.
 - **`boot_id` + `capability_hash` recovery gating** — recovery is allowed only when the gateway's advertised capability set is unchanged since the session was created. A frozen capability object is both declared on the server and hashed; a matching hash means recovery is safe, a differing hash forces a clean re-init. This prevents handing a client a transport whose negotiated capabilities are stale.
 - **Auto-nuke stale sessions on capability change** — on the first boot after a capability change, rows whose `capability_hash` no longer matches are deleted in one pass, so a capability-changing deploy surfaces the client re-init path at most once instead of wedging sessions indefinitely.
@@ -95,13 +95,16 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 ### Access control
 
-- **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry.
+- **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry. Administrators are named by configuration; see [Administrators](#administrators).
+- **Admin list-all**: `namespaces.listAll`, `endpoints.listAll` and `mcpServers.listAll` are admin-only and return every row with its owner (`user_id`, null for public), so administrators can see rows owned by other users. Opening, editing or deleting such a row still requires being its owner. The existing `list` procedures are unchanged (public rows plus the caller's own, for admins too), because consumers that match rows by name, such as a config sync over `mcpServers.list`, must not start seeing rows they never saw before. The namespace create form always creates a public namespace and no longer offers a "For myself" option, which never made a namespace private.
+- **Per-namespace tool policy**: each namespace is either `allow_all` (the default: a tool with no curation row is served, so a tool added to a server later appears there without review) or `allowlist` (only tools switched on in the namespace are listed or callable, so a new tool stays hidden until an administrator switches it on). Set with the admin-only `namespaces.setToolPolicy` (audited as `namespace.tool_policy`; also a switch on the namespace page) and returned as `tool_policy` on every namespace response. A tools refresh in an allowlist namespace records new tools switched off and never changes an existing tool's state. Saving a namespace's server list reconciles rows: rows of servers that left the list are deleted, retained tool and server rows keep their status, overrides and identity, and new tool rows start ACTIVE under `allow_all` and INACTIVE under `allowlist` ([#212](https://github.com/Umbrella-IT-Group/metamcp/pull/212)). Ships inert: every existing namespace is `allow_all`, and setting it back is the rollback.
 - **Endpoint access groups** — named groups that decide which OAuth users may reach which endpoints, so publishing one connector per business system no longer means publishing all of them to everyone who can log in. See [Access groups](#access-groups).
+- **API-key IP allowlists**: per-key or global CIDR lists in audit or enforce mode, checked on the data plane, token introspection and the admin-plane bearer. OAuth is never affected. See [API-key IP allowlists](#api-key-ip-allowlists).
 
 ### Observability
 
 - **`/health/upstream` rollup** — a health endpoint reporting per-backend reachability and pool config, truthful for down HTTP/SSE backends (which never trip the STDIO crash breaker).
-- **Live Logs with consumer identity + tool-call auditing** — the Live Logs view records connection, tool-call, client-session, and server events with categories and filters; every proxied `tools/call` is audited with the authenticated caller (API-key name or OAuth email), tool, backend, duration, and outcome. A persistent `tool_call_audit` table stores a hash of arguments (never the raw args) with configurable retention.
+- **Live Logs with consumer identity + tool-call auditing** — the Live Logs view records connection, tool-call, client-session, and server events with categories and filters; every proxied `tools/call` is audited with the authenticated caller (API-key name or OAuth email), tool, backend, duration, and outcome. A persistent `tool_call_audit` table stores a hash of arguments with configurable retention. Argument values are never stored, with one deliberate exception: the value of six allowlisted selector keys (`mode`, `action`, `profile`, `operation`, `entity`, `method`) when it is a short identifier. The argument key names are stored too (`args_shape`), so "which mode, which parameters" friction is queryable per consumer. A tool's structured in-band refusal (an `error` envelope on a result with `isError` unset) is recorded as a failure too, with the tool's own code token in `error_detail`; see [Audit outcome classes](#audit-outcome-classes).
 - **Durable gateway event history** — the Live Logs page has a **History** mode backed by a persistent `gateway_events` table, so connection, client-session, server and system activity survives a restart instead of living only in a 2000-entry in-memory buffer. Browsable by time range, category, level, server, client and message substring, with keyset paging. Rows are **immutable for 30 days** at the database level (UPDATE and TRUNCATE are refused at any age; DELETE is refused inside the window), and age out after `GATEWAY_EVENTS_RETENTION_DAYS`.
 
 ### No-reboot tool updates
@@ -180,7 +183,7 @@ Cutover order:
 
 1. Set `METAMCP_RUNTIME_DB_PASSWORD` in `.env` to a strong value.
 2. `docker compose up -d` (a recreate, not a restart — the variable has to reach the entrypoint).
-3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool. The failure shape is the same line with `rolsuper=true` and the words `remain bypassable by this credential` — that means the split did not take. It is also written to `audit_log` as `db.runtime_split.ineffective`, so it can be alerted on rather than only watched for.
+3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool and the gateway-events pool (all three request-path pools are checked). The failure shape is the same line with `rolsuper=true` and the words `remain bypassable by this credential`, which means the split did not take. It is also written to `audit_log` as `db.runtime_split.ineffective`, so it can be alerted on rather than only watched for.
 
 The dev stack (`docker-compose.dev.yml`) runs the same step from its own entrypoint, so it honours the switch too. Both compose files read the same `.env`.
 
@@ -196,8 +199,8 @@ table created by a future migration starts out fully writable by the runtime rol
 append-only table must be added to the revoke list in `scripts/ensure-runtime-role.sh`; a test
 asserts that every table a migration protects with an immutability trigger appears there.
 
-See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record, and [`SECURITY.md`](SECURITY.md)
-to report an issue. Several of these items apply to upstream unchanged; we coordinate them privately
+See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record. Report a security weakness through
+[`SECURITY.md`](SECURITY.md), and anything else through [GitHub Issues](https://github.com/Umbrella-IT-Group/metamcp/issues). Several of these items apply to upstream unchanged; we coordinate them privately
 with the upstream maintainers before any public detail.
 
 ## Where we diverged from upstream
@@ -236,7 +239,7 @@ Upstream community resources (Discord, docs, DeepWiki) live at [`metatool-ai/met
 docker pull ghcr.io/umbrella-it-group/metamcp:latest
 ```
 
-Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64 and published on every push to `umbrella`.
+Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64, public (no registry login needed), and published when a push to `umbrella` changes a path watched by [the build workflow](.github/workflows/umbrella-build.yml). If the pull is denied, please [open an issue](https://github.com/Umbrella-IT-Group/metamcp/issues) with the exact error text, with secrets and internal hostnames redacted.
 
 ### Build from source with Docker Compose
 
@@ -250,6 +253,8 @@ docker compose up -d
 ```
 
 Edit `.env` before that first `docker compose up`. `POSTGRES_PASSWORD` has no default in any of the compose files: leave it unset and compose stops and names it, rather than falling back to a password published in this repository. `example.env` assigns it an obvious placeholder, which is enough to get past that check but is not a password. Replace it. `BETTER_AUTH_SECRET` is required the same way and for a sharper reason: it is the session signing key, so whoever holds it can mint a session cookie for any account without a password, and its old compose default was published here too. Generate one with `openssl rand -hex 32`. Unlike `POSTGRES_PASSWORD` it has no initdb coupling, so an existing deployment can change it at any time; doing so invalidates sessions signed with the old key and signs everyone out once. Upgrading an existing deployment: Postgres reads `POSTGRES_PASSWORD` only when the data volume is first initialized, so a volume created under the old published default keeps that password until you run `ALTER USER metamcp_user WITH PASSWORD '<new>'` in the running database; set `.env` to whatever the volume actually uses, or rotate with `ALTER USER` first, otherwise the app fails Postgres authentication on next start. The other thing to edit is the bootstrap account. This fork ships **registration closed** (`BOOTSTRAP_DISABLE_REGISTRATION_UI=true`, see [Registration controls](#registration-controls)), so nobody can self-register a first administrator through the UI: the account bootstrap creates is the only way in. Out of the box that is `example.env`'s placeholder `BOOTSTRAP_USER_EMAIL` / `BOOTSTRAP_USER_PASSWORD` pair (`test@user.example` / `REPLACE_ME__generate_a_strong_password`), which is a placeholder rather than credentials you want on a running gateway. The backend warns loudly at boot if that placeholder is still the configured password, and again if `BETTER_AUTH_SECRET` is still `example.env`'s. Set `BOOTSTRAP_USERS` (a JSON array, the recommended form) or those two single-user variables to real values first.
+
+The compose files publish both ports on loopback (`127.0.0.1:12008` and `127.0.0.1:9433`) rather than every host interface, so a box with a public IP does not expose the unauthenticated app port or the raw Postgres port to the network by default. `localhost:12008` still works on the host. To reach the app from another machine, put a reverse proxy or an SSH tunnel in front of it rather than widening the bind. This matches the loopback posture the platform overlay enforces on the real deployment.
 
 If you change `APP_URL`, access the app only from that URL. MetaMCP applies CORS per route: the OAuth discovery endpoints allow any origin, while the app and API routes (`/api/auth`, `/trpc`, `/mcp-proxy`, `/metamcp`) are restricted to an allowlist of `APP_URL` plus any origins you add to `EXTRA_TRUSTED_ORIGINS` (comma-separated). The Postgres volume name is global and may collide with other Postgres containers; rename `metamcp_postgres_data` in `docker-compose.yml` if needed.
 
@@ -281,6 +286,25 @@ Bootstrap is exempt from its own lock, and it has to be. It creates the configur
 
 One limit worth knowing: these controls are only asserted when bootstrap runs at all. A `BOOTSTRAP_ENABLE=false` deploy writes no row, which upstream's readers treat as open, so such a deploy keeps upstream's behaviour and has to close registration by hand in the admin UI.
 
+### Administrators
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `METAMCP_ADMIN_EMAIL` | unset | Comma-separated email addresses of existing accounts to promote to `admin` on every boot. Matched case-insensitively. |
+
+Accounts get the `member` role by default, and only an administrator can change admin-gated settings or curate servers, namespaces, endpoints and API keys. There is no UI path to grant the role, so the deployment names its administrators here and every boot converges the database toward that list. It runs after migrations and environment bootstrap, so an account `BOOTSTRAP_USERS` creates is promoted on the same boot, and before the server starts listening. It is independent of `BOOTSTRAP_ENABLE`.
+
+- **Named accounts only.** Nothing is ever promoted by position (no "first user" or "only user" rule).
+- **Never demotes.** Removing an address from the list leaves that account an administrator; demote it deliberately in the database.
+- **Never creates accounts.** An address with no account logs a warning and is promoted on the first boot after the account exists.
+- **Ambiguous addresses are skipped.** If one address matches two accounts that differ only in letter case, neither is promoted and a warning says so.
+- **Audited.** Each promotion writes a `user.role.set` row to `audit_log` (`actor_type` `system`, `detail.source` `admin_email_env`). A restart that changes nothing writes nothing.
+- **Unset is a no-op.** With the variable unset or empty, nothing is written; the boot log records how many administrators exist.
+
+If no administrator exists after the pass, the boot log carries a `NO ADMINISTRATOR` warning naming this variable and the SQL fallback: `UPDATE users SET role = 'admin' WHERE email = '<address>';`. **Upgrading an existing install past migration `0020`** turns every existing account into a `member`, so set `METAMCP_ADMIN_EMAIL` to your own address before (or right after) the upgrade and restart.
+
+Admin identity is a deployment concern, not a committed one: name it through `METAMCP_ADMIN_EMAIL`, not a literal baked into a committed migration. Two early seed migrations (`0020_users_role.sql`, `0022_promote_ci_admin.sql`) predate this and promote specific addresses by literal; they are left in place because they have already run in production and this repository's history is public, so rewriting them would change nothing an attacker cannot already read while breaking every deployed migration checksum. The `migrations-no-email-literals` backend test fails any migration written after the current head that reintroduces an address literal, so the seed identities stay a bounded, historical residual.
+
 ### Sign-in rate limiting
 
 | Variable | Default | Purpose |
@@ -297,12 +321,30 @@ Better-auth's own rate limiter stays pinned off and should not be enabled instea
 
 A refusal is a `429` with a `Retry-After` and writes no audit row (a row per refusal would amplify the writes being bounded); it is reported to the log instead, at most one line a minute, carrying a running total since startup.
 
+#### Per-credential session ceiling
+
+`MCP_MAX_SESSIONS_PER_CREDENTIAL` (default `100`, `0` disables) limits new-session admissions per credential; a credential at the limit gets a `429` on its next `initialize` unless one of its idle sessions can be evicted to make room (see below). Past 80% the gateway logs `Concurrent-session usage high for <method> credential "<name>": N/M live sessions`, and at the limit `Concurrent-session ceiling reached ...`, plus a throttled `client` gateway event.
+
+Those lines now end with a short clause saying what is filling the credential, for example `live: autotask=21, itglue=21, ninja=21 (top 5 of 14 endpoints); in-flight 187, idle 113, oldest idle 1710s`: sessions per endpoint (highest first, at most five names), how many hold a request in flight (an open stream counts) versus idle, and how long the quietest idle one has been silent. Sessions the idle sweeper does not track (SSE) are counted as `untracked`. A mostly-idle, old set means abandoned sessions from a client that never closes them; a mostly in-flight set means open streams. The clause carries counts and endpoint names only, never a session id or a token, is bounded to about 180 characters, is built only when a credential is approaching or at the ceiling, and cannot affect the admission decision (a fault building it just leaves the line without the clause).
+
+At the ceiling, a new session is admitted by evicting the credential's longest-idle StreamableHTTP session instead of being refused, provided that session has nothing in flight (no running request and no open standalone GET stream, which is how a live Claude Code process looks) and has been idle for at least the configured floor. Only the credential's own sessions are considered; an SSE stream is never evicted. The eviction keeps the session's `mcp_sessions` row, so a client that comes back with the id lazily recovers it under the same id, exactly as after an idle-sweeper reap; a request that arrives while the evicted session is still being torn down waits for the teardown, for at most 5 seconds, then recovers (past that bound it gets the reinitialize `404` with a WARN, `Lazy recovery: a ceiling eviction teardown has not finished after 5000 ms; ...`, and the client opens a new session), and two requests that arrive together on one id that is not resident (after an eviction, a sweep or a restart) share a single recovery instead of colliding. The admitting request waits for the evicted session to release its backend connections before taking its own, but for at most 5 seconds: past that it is admitted anyway with a warning (`Session ceiling eviction: the evicted session's teardown on <endpoint> has not finished after 5000 ms; ...`) and the teardown finishes in the background, so a slow backend cannot stall a new session. Each eviction logs `Concurrent-session ceiling: evicted idle session on <endpoint> (idle Ns) for <method> credential "<name>" to admit a new session (N/M)` at INFO, followed by the same live clause, and records a throttled `client` event at `info` level; the `/health/sessions` admin body counts them under `ceilingEvictions`. When nothing qualifies, the `429`, its body and the `Concurrent-session ceiling reached ...` WARN are unchanged, so a log rule on that line fires only for a real refusal.
+
+With eviction enabled, every allowed initialize or SSE stream-open reserves its slot before awaiting the pool, including admissions below the ceiling. Registration replaces that reservation synchronously; failures and client disconnections release it, and a late pool result is cleaned up rather than registered. Initial connects are marked in flight before the first await, so a slow connect cannot become an eviction candidate. A failed eviction transport close still releases the pools before its recovery gate opens. Eviction cleanup and recovery-wait logs omit victim ids and exception values.
+
+Lazy recovery takes part in the ceiling under the rule "evict, never refuse" (ruled 2026-10-06). A returning client whose session is not resident (after an eviction, a sweep or a restart) and whose credential is at its ceiling first evicts one of that credential's idle StreamableHTTP sessions, chosen, reserved and awaited exactly as for an `initialize`, with the same `Concurrent-session ceiling: evicted idle session on ...` INFO line and a `client` event that says it admitted a recovered session rather than a new one. When nothing qualifies it is recovered anyway, over the ceiling, and logs one INFO line, `Session recovery over the concurrent-session ceiling for <method> credential "<name>": N/M live sessions and none idle long enough to evict; recovering it anyway, since a reconnect is never refused.`, followed by the live clause; that line matches none of the ceiling patterns above and records no event, because nothing was refused. A recovery is never refused or failed because of the ceiling, so the ceiling bounds the sessions a credential opens, not every resident one: returning clients can hold a credential above it until the idle sweeper reaps sessions or clients close them. Evictions do not bring it back down, since each one frees a slot for exactly one session. Below the ceiling a recovery reserves its slot like an admission but evicts nothing and logs nothing about the ceiling; with `MCP_SESSION_CEILING_EVICT_IDLE` off it has no ceiling interaction at all. Unlike an admission, a recovery keeps its slot when its client disconnects and still registers the session, as recovery always has; releasing the slot early would let that registration exceed the ceiling without first trying to evict. The hold lasts at most the 5-second eviction wait plus the instance build and connect, which do not wait on a backend.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCP_SESSION_CEILING_EVICT_IDLE` | on | Kill switch for eviction at the ceiling. `false`, `0`, `off`, `no`, `disable` or `disabled` (any case) restores the plain refusal; any other non-empty value that is not `true`, `1`, `on`, `yes`, `enable` or `enabled` keeps it ON and logs a warning, so check the spelling when using it to roll back. Takes effect when the gateway restarts with the new value (a compose recreate); a running process keeps the environment it started with. |
+| `MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS` | `120` | How long a session must have been idle before the ceiling may evict it. Accepts a whole non-negative decimal integer with safe millisecond arithmetic. A malformed, negative or unsafe value falls back to the default; a value below `10` (including `0`) is raised to `10`, each with a warning. The floor keeps newly negotiated sessions out of the eviction set while their clients prepare the next call. |
+
 ### OAuth and session lifetimes
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `86400` (24h) | MCP OAuth access-token lifetime (was hardcoded 1h upstream). |
 | `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `31536000` (365d) | MCP OAuth refresh-token lifetime. Refresh tokens rotate on use. |
+| `OAUTH_REFRESH_CLIENT_AUTH` | `log` | Client authentication on the refresh_token grant for a confidential client (`client_secret_post` or `client_secret_basic`; public `none` clients are never affected). `log` checks the secret the way the authorization_code grant does, records the outcome (`verified`, `missing` or `invalid`, never the value) as `client_auth=` on the `[oauth] token issued` line and in the `oauth.token.refresh` audit row, warns on anything but `verified`, and still issues. `enforce` refuses anything but `verified` with 401 `invalid_client` (RFC 6749 section 6) and leaves the refresh token unrotated. Any other value falls back to `log` with a warning; the value in effect is logged at boot. |
 | `BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS` | `2592000` (30d) | Better-auth session lifetime. |
 | `BETTER_AUTH_SESSION_UPDATE_AGE_SECONDS` | `604800` (7d) | Better-auth session refresh age. |
 | `SESSION_LIFETIME` | unset (persistent) | Backend MCP session lifetime; unset = never expire. |
@@ -327,12 +369,60 @@ A refusal is a `429` with a `Retry-After` and writes no audit row (a row per ref
 |---|---|---|
 | `LOG_MAX_SIZE_MB` | `50` | In-container log-file rotation threshold. |
 | `TOOL_AUDIT_RETENTION_DAYS` | `90` | `tool_call_audit` retention. `0` or negative keeps rows forever (pruning is skipped entirely). Values `1`-`29` are raised to `30` at boot with a warning, because migration `0032` makes rows undeletable inside a 30-day window. |
+| `TOOL_AUDIT_ARGS_SHAPE` | on | Records `tool_call_audit.args_shape` (migration `0039`): only the top-level argument key names this proxy's own final tools/list inputSchema declares (other keys are counted, never named). Snapshots are isolated per proxy, replaced after listing and invalidated on list_changed; unlisted paths, including the OpenAPI bridge, store counts only. Six allowlisted selector keys store their value only when the schema declares an enum or const and the value is a member (and at most 32 identifier characters); a non-member or an unsupported reference or composition stores `?`, and a selector with no enum or const stores `*` (sent, value not from a closed set, so not recorded). Schemas over 256 properties and listings over 5,000 tools store counts only; selector value collections over 256 entries store a marker. No other argument value is recorded. `off`, `false` or `0` stores NULL instead. Rows are write-once, so a wrong shape cannot be corrected afterwards; this is the kill switch. |
+| `TOOL_AUDIT_INBAND_CLASSIFY` | on | Classifies a tool's in-band refusal as a failure in `tool_call_audit` (`success=false`, `error_code='inband_error'`, the tool's code in `error_detail`). `off`, `false` or `0` disables that step only; `isError`, unknown-tool and retired-name handling keep working. Rows are write-once, so this is the kill switch for a misclassification. |
+| `RETIRED_TOOLS_FILE` | unset | Path of the retired-tool map (JSON). Unset means the redirect is inert and the filesystem is never touched. See [Retired-tool redirect](#retired-tool-redirect). |
+| `RETIRED_TOOLS_RELOAD_SECONDS` | `30` | How often the map file is re-checked, on the failure path only (clamped to 5-3600; an invalid value falls back to 30 with a warning). |
 | `GATEWAY_EVENTS_RETENTION_DAYS` | `90` | `gateway_events` retention. Floor-clamped to 30 with a boot warning: rows are immutable for their first 30 days at the database level, so a lower value cannot take effect. There is no "keep forever" value. Reclaiming in-window space is a deliberate break-glass act, not a config change — see below. |
 | `AUDIT_STORAGE_CHECK_INTERVAL_SWEEPS` | `12` | How many 5-minute cleanup sweeps between audit-table storage checks, so the default is hourly. Values below `1` fall back to the default and anything above `288` (24h) is capped, both with a boot warning: there is deliberately no value that turns the check off. The per-check reading is logged at INFO, so it only reaches stdout (and therefore a log shipper) when `LOG_LEVEL` is `info` or `all`; see the note below. |
 | `AUDIT_STORAGE_WARN_MB` | `2048` | Per-table size at which the storage check escalates from an INFO line to a WARN plus a `system` event in the gateway history. At most one warning per table per 24h while the condition lasts; a table falling below 90% of the threshold re-arms it. Capped at `1048576` (1 TiB) with a boot warning, so a threshold nothing can reach cannot be used as an off switch. |
 | `TOOLS_SWEEP_INTERVAL_SECONDS` | `60` | Periodic tool-definition drift sweep (`0` disables). |
 | `PUBLIC_SESSION_TTL_SECONDS` | `86400` (24h) | Idle-time TTL for public StreamableHTTP sessions before reap. |
 | `SESSION_SWEEP_INTERVAL_SECONDS` | `300` | Public-session sweeper interval (`0` disables). |
+
+#### Audit outcome classes
+
+`tool_call_audit.success` and `error_code` describe the outcome of a proxied `tools/call`. The classifier only reads the result; it never changes what the client receives (the middleware returns the same object).
+
+| `error_code` | Meaning |
+|---|---|
+| `NULL` (`success=true`) | The call returned a result with no failure signal. |
+| `tool_error` | The result has `isError: true`. `error_detail` carries the tool's code token when the body is an envelope, or `validation` for an argument-validation refusal. |
+| `inband_error` | `isError` is unset but the top level of the result's envelope reports a refusal: `error` is `true`, a non-blank string or a non-empty object, or `status` is `failed` or `partial`, or `partial` is `true`. `error_detail` is the tool's code token (a lowercase snake_case code under 48 characters with no id in it), or a fixed marker (`status_failed`, `partial`), or NULL. |
+| `unknown_tool` | The call named a tool nobody serves: the gateway's own `Unknown tool` error, a backend's not-found answer, or the filter's unresolved-server denial. |
+| `tool_retired` | The retired-tool redirect answered (see [Retired-tool redirect](#retired-tool-redirect)). |
+| anything else | A thrown protocol error: its numeric code (for example `-32001` for a timeout) or its class name. |
+
+The in-band rule inspects the TOP LEVEL only. `error` absent, `null`, `false`, an empty string, a number or an empty collection is a success (a tool may return `error: null` on every success). Nested keys are never read, so a section that degraded inside a good result, a write's failed read-back object and per-item failures inside a list do not mark the call failed. A refusal carried only by `ok: false`, `warning` or `note` is a known false negative.
+
+`success` changed meaning at the deploy that introduced `inband_error`: earlier rows recorded such refusals as `success=true` and cannot be reclassified (rows are write-once). Compare failure rates across that date with care.
+
+The Live Logs line for an in-band refusal is `<tool> refused in-band: <detail> (<ms>ms)` at level `warn`, deliberately worded without the words that log-based error panels count.
+
+#### Retired-tool redirect
+
+A client that cached an old tool list, or an automation node that still names a removed tool, calls a name nobody serves and gets a bare `Unknown tool`. When `RETIRED_TOOLS_FILE` points at a map file, the gateway answers such a call with what replaced the tool instead:
+
+```json
+{ "error": true, "code": "tool_retired",
+  "message": "<server>__<tool> was retired on 2026-09-02 and is no longer served. Use <server>__<replacement>(mode=\"x\"). Refresh your tool list (tools/list) if your client cached an older one.",
+  "context": { "retired": "...", "since": "...", "replacement": "...", "replacement_call": "...", "also": [], "skill": "...", "hint": "..." } }
+```
+
+It is returned as an `isError` result with no `structuredContent` (a client validating that against a cached output schema would otherwise turn the message into a validation failure). Over the OpenAPI bridge it surfaces as the bridge's usual `403` body. One status change to know about: a name in the map that the bridge handler itself throws as `Unknown tool` (no server with that prefix any more) used to answer `404 "Tool not found"` and now answers this `403` redirect, because the redirect is an `isError` result. A name outside the map keeps the `404`, and a backend's own not-found answer was already a `403`.
+
+Properties that make it safe to run in front of live automation:
+
+- **Failure-gated.** The map is consulted only AFTER a call has already failed as an unknown tool: the gateway's own `Unknown tool` throw, a backend's not-found answer for a name the gateway still routes to it, or the filter's fail-closed denial for a server prefix that no longer resolves. A call that succeeds, and every other failure (timeouts, broker errors, validation refusals), passes through untouched with zero lookups. A map entry therefore cannot shadow a live tool; a wrong or stale entry degrades to the old bare error.
+- **Executes nothing.** The redirect forwards nothing and is not an alias: the old name still does not answer.
+- **Data only, fail open.** The file never influences routing or access. A missing, unreadable or invalid file keeps the last good map (or none) and logs one warning per five minutes. An entry that fails validation is dropped alone with a warning naming it; a wrong version, a non-object root, a file over 262144 bytes or more than 500 entries rejects the file.
+- **Recorded.** The audit row is `error_code='tool_retired'` (`success=false`), so retired-name traffic by consumer is one SQL query even when the caller swallows the failure.
+
+File format (version 1): `{"version": 1, "retired": {"<server>__<tool>": {"since": "YYYY-MM-DD", "replacement": "<server>__<tool>" | null, "args": {"mode": "..."}, "call": "...", "also": ["<server>__<tool>"], "skill": "...", "hint": "..."}}}`. `since` is required and must be a real, non-future date; at least one of `replacement`, `also`, `skill` or `hint` is required. Limits: `args` up to 4 keys (`[a-z_]{1,24}` to `[A-Za-z0-9_|.-]{1,80}`), `call` 160 characters, `also` 4 names, `skill` 80, `hint` 280, no control characters. Mount the file's DIRECTORY read-only rather than the file itself: replacing a checked-out file replaces its inode, and a single-file bind mount would keep serving the old content.
+
+#### Timeout adjudication hint
+
+When a `tools/call` times out (`-32001`), the client now receives the same error with added text: the outcome is unknown (the tool may have applied the change, partly applied it, or still be finishing), and for a tool that changes anything the caller should read the target's current state before retrying. The text names no actor and no duration, because a backend can raise the same `-32001` with the same data shape (Sol review, 2026-10-02). The MCP SDK client does send `notifications/cancelled` on a timeout and a Python SDK backend acts on it, but whether the cancel landed before, during or after the work cannot be known at the gateway, so the text claims neither "cancelled" nor "not cancelled" (an earlier wording said the call was not cancelled, which was false). Errors with either SDK timeout message and its numeric `data.timeout` or `data.maxTotalTimeout` shape are annotated, including backend-raised errors with that shape; an unknown-session `-32001` remains unchanged. The call is still never re-sent by the gateway.
 
 **Break-glass on `gateway_events` and `tool_call_audit`.** Both carry the same 30-day window (migrations `0031` and `0032`), so the same rules apply to each. Nothing in the application can delete a row inside that window, and that includes the retention sweepers: a `DELETE` that touches even one in-window row raises, and the raise rolls back the entire statement, so a mixed-range prune reclaims nothing rather than partially succeeding. That rollback is why both retention variables are floor-clamped rather than trusted: an under-range setting would stop pruning altogether instead of shortening it. Reclaiming space early therefore requires a superuser at the database — `ALTER TABLE <table> DISABLE TRIGGER <table>_no_recent_delete`, or `SET session_replication_role = 'replica'` for the session — and re-enabling afterwards. Treat that as an audit-worthy act: it is the one operation that can remove evidence these tables exist to preserve, it leaves no trace in the table itself, and the ordinary answer to a full disk is to lower the retention variable toward its floor and wait for the window to pass.
 
@@ -424,6 +514,28 @@ Membership decisions are cached in-process for 60 seconds and dropped immediatel
 
 One limit worth knowing: the gate runs per request, so restricting an endpoint does not disconnect a notification stream that is already open. No tool call can land through it, because every call is a fresh request that re-runs the gate, but `list_changed` and log notifications keep flowing on that connection until the client disconnects.
 
+### API-key IP allowlists
+
+An API key normally works from any address, so a key that leaks works for whoever holds it. An IP allowlist binds a key to the networks its real caller uses. It applies to API keys only: OAuth sign-ins (MCP connectors, browser and SSO sessions) are never evaluated against it.
+
+Each key either has its own list (`api_keys.allowed_cidrs`) with its own mode, or has none and follows the **global** list and mode. A mode is one of:
+
+| mode | effect on a request from an address outside the list |
+| --- | --- |
+| `off` (default) | nothing is checked |
+| `audit` | the request is served and a throttled `apikey.ip.would_deny` audit row is written |
+| `enforce` | the request is refused with `403` and the same generic message other credential refusals use, and a throttled `apikey.ip.denied` audit row is written |
+
+Both rows carry `detail.reason = "api_key_ip_not_allowed"`, the surface (`data_plane`, `oauth_introspect` or `admin_plane`), the policy source (`key` or `global`) and why the address failed (`not_in_list`, `missing`, `unparsable`). Rows are throttled to one per key and address per ten minutes, plus a per-key budget per window, with the suppressed counts carried on the next row, so a refused caller cannot flood the append-only audit table.
+
+Where it is checked: inside both key validators, so it covers the data plane (`/metamcp/*`, both API-key branches), `POST /oauth/introspect` and the admin-plane bearer on `/trpc`. The admin UI's `apiKeys.validate` helper deliberately does not check it. The client address is `CF-Connecting-IP` (see the trust note in `middleware/audit-context.middleware.ts`); `X-Forwarded-For` and the socket address are never used. Under `enforce`, a request with no readable address is refused.
+
+The one exemption is explicit: a list holding both `0.0.0.0/0` and `::/0` admits any address and also a request with no address, for callers with no stable address such as CI runners.
+
+On the data plane, an IP refusal is evaluated before the plane, account and endpoint-scope checks, so a holder from the wrong address learns nothing about the key; on `/trpc` the check runs after the plane check, so a data-plane key presented there gets the usual 401. An IP refusal is not counted by the failed-credential rate limiter, because the credential itself is valid.
+
+It ships inert: every existing key follows the global policy, whose mode is unset (`off`). Administrators manage policies on the **API Keys** page (an **IP policy** column and editor in the admin table, and a **Global IP policy** panel above it) or through the admin-only tRPC procedures `apiKeys.setIpPolicy`, `apiKeys.getGlobalIpPolicy` and `apiKeys.setGlobalIpPolicy`; each write emits an `apikey.ip_policy.set` or `config.api_key_ip_policy.set` audit row with the old and new value. `apiKeys.listAll` shows each key's list, mode and `last_used_ip` (the address of its last request, updated with `last_used_at`). The server refuses `enforce` with an empty list, a per-key mode without a per-key list, and any entry that is not a valid CIDR (including one with host bits set). `API_KEY_IP_POLICY_DISABLED=true` turns all IP evaluation off process-wide (see `example.env`).
+
 For reverse-proxy (nginx) setups with SSE long connections, see [`nginx.conf.example`](nginx.conf.example). A 2–4GB instance is the practical minimum for a hosted deployment.
 
 ## Architecture
@@ -455,7 +567,7 @@ sequenceDiagram
 
 ## Contributing and upstreaming
 
-Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). PRs target `umbrella`, squash-merged after review and gates.
+Contributions welcome. Bugs and feature requests go to [GitHub Issues](https://github.com/Umbrella-IT-Group/metamcp/issues), questions to [Discussions](https://github.com/Umbrella-IT-Group/metamcp/discussions), and security reports through [`SECURITY.md`](SECURITY.md). [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup and the pull request flow: PRs target `umbrella` and are squash-merged after review and gates.
 
 When a patch is generic (a bug fix or config option that isn't Umbrella-specific), branch off `main`, open it against `metatool-ai/metamcp`, and once merged upstream we drop our private carry. [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) tracks the full cherry-pick log, which of our patches converged upstream, and the upstreaming backlog.
 

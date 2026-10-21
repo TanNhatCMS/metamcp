@@ -1,11 +1,25 @@
 import { z } from "zod";
 
+// The authorization server a stored upstream credential belongs to. MCP SDK
+// 1.31 `auth()` stamps it on everything it hands to `saveClientInformation` /
+// `saveTokens`, and on read refuses to present a value stamped for a different
+// authorization server (GHSA-6qxp-vccf-f47h). It is not part of the OAuth wire
+// format, so it has to be carried here explicitly: `z.object` strips unknown
+// keys, and while these two schemas lacked the field the stamp was dropped on
+// the way into `oauth_sessions` and every stored client_secret and refresh
+// token read back unbound, i.e. sendable to whatever authorization server the
+// upstream MCP server advertised next. Optional because rows written before
+// 1.31 have none; the Inspector's provider (apps/frontend/lib/oauth-provider)
+// refuses to present those to any authorization server.
+const OAuthIssuerSchema = z.string().optional();
+
 // OAuth Client Information schema (matching MCP SDK)
 export const OAuthClientInformationSchema = z.object({
   client_id: z.string(),
   client_secret: z.string().optional(),
   client_id_issued_at: z.number().optional(),
   client_secret_expires_at: z.number().optional(),
+  issuer: OAuthIssuerSchema,
 });
 
 // OAuth Tokens schema (matching MCP SDK)
@@ -15,6 +29,7 @@ export const OAuthTokensSchema = z.object({
   expires_in: z.number().optional(),
   scope: z.string().optional(),
   refresh_token: z.string().optional(),
+  issuer: OAuthIssuerSchema,
 });
 
 /**
@@ -37,7 +52,13 @@ export const OAuthClientRegistrationSourceEnum = z.enum(["dcr", "admin"]);
 // OAuth Client schema for registered clients
 export const OAuthClientSchema = z.object({
   client_id: z.string(),
+  // Salted-hash at rest (migration 0036): client_secret holds the sha256 of
+  // secret||salt, not the secret. Nullable for a PKCE/public client that has
+  // no secret. Never leaves the server, the list view exposes presence only.
   client_secret: z.string().nullable(),
+  // The salt for client_secret above (migration 0036). NULL when there is no
+  // secret. Read by verifyClientSecret at the token endpoint.
+  client_secret_salt: z.string().nullable().optional(),
   client_name: z.string(),
   redirect_uris: z.array(z.string()),
   grant_types: z.array(z.string()),
@@ -75,13 +96,20 @@ export const OAuthAuthorizationCodeSchema = z.object({
 
 // OAuth Access Token schema
 export const OAuthAccessTokenSchema = z.object({
+  // Hash at rest (migration 0036): the sha256 of the token, not the token.
   access_token: z.string(),
+  // Last 4 characters of the token, kept for the admin view (migration 0036).
+  access_token_last4: z.string(),
   client_id: z.string(),
   user_id: z.string(),
   scope: z.string(),
   expires_at: z.date(),
   refresh_token: z.string().nullable(),
   refresh_token_expires_at: z.date().nullable(),
+  // Refresh-token family (migration 0037): every pair in one refresh chain
+  // shares this id, so reuse of a rotated-out token can revoke the whole
+  // lineage. A uuid rendered as a string.
+  family_id: z.string(),
   created_at: z.date(),
 });
 
@@ -377,9 +405,13 @@ export type DeleteOAuthClientResponse = z.infer<
 // this schema, not masked — `access_token` is the table's primary key and a
 // bearer credential for the whole gateway. Same rule as
 // OAuthClientListItemSchema and AdminApiKeyItemSchema: presence only, via
-// `has_refresh_token`.
+// `has_refresh_token`. The one readable fragment is `access_token_last4`, the
+// four-character tail the table now stores (migration 0036) and the audit log
+// already records, safe to show, and enough to correlate a listed token with
+// an audit row.
 export const ActiveOAuthTokenItemSchema = z.object({
   user_id: z.string(),
+  access_token_last4: z.string(),
   // LEFT JOINed: nullable so a token whose user row vanished mid-cascade
   // still appears in the listing instead of dropping out of it. An orphaned
   // live token is exactly the thing an administrator must be able to see.

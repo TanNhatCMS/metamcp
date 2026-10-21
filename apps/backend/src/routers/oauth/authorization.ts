@@ -6,6 +6,7 @@ import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
 import { oauthRepository, usersRepository } from "../../db/repositories";
+import { sendLoopbackConsentSuccess } from "./consent-success-page";
 import {
   CONSENT_REQUEST_TTL_MS,
   consentCsrfCookieName,
@@ -17,9 +18,11 @@ import {
 import {
   generateSecureAuthCode,
   getBaseUrl,
+  getIssuerIdentifier,
   GRANTED_OAUTH_SCOPE,
   isAllowedRedirectUri,
   isConsentDecisionRateLimited,
+  isLoopbackRedirectUri,
   type OAuthParams,
   rateLimitAuth,
   validateRedirectUri,
@@ -213,12 +216,16 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
       });
     }
 
-    // Validate PKCE method (OAuth 2.1 recommends S256)
-    if (code_challenge_method !== "S256" && code_challenge_method !== "plain") {
+    // Validate PKCE method. S256 only: the AS metadata advertises S256 as the
+    // sole supported method, and "plain" gives no protection against code
+    // interception (the challenge equals the verifier and rides in this query
+    // string), so accepting it here would contradict the metadata and let an
+    // anonymously registered client drive an unprotected flow. Rejected through
+    // the standard invalid_request error path.
+    if (code_challenge_method !== "S256") {
       return res.status(400).json({
         error: "invalid_request",
-        error_description:
-          "Unsupported code_challenge_method. Supported: S256, plain",
+        error_description: "Unsupported code_challenge_method. Supported: S256",
       });
     }
 
@@ -641,6 +648,16 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
     clearConsentCookie(req, res, consentRequest.cid);
 
     const redirectUrl = new URL(consentRequest.redirect_uri);
+    // RFC 9207: every authorization response (the code below and the
+    // access_denied redirect) carries `iss`, the issuer identifier, so a client
+    // cannot be tricked into accepting a code minted by a different
+    // authorization server (mix-up defense). Set once here because it applies
+    // to both the grant and the denial that share this redirectUrl. It goes
+    // through getIssuerIdentifier, the SAME helper the AS metadata `issuer`
+    // uses, because RFC 9207 2.4 has the client compare the two by simple string
+    // comparison: getBaseUrl alone omits the trailing slash the metadata issuer
+    // carries, so a strict client would abort every response.
+    redirectUrl.searchParams.set("iss", getIssuerIdentifier(req));
     if (consentRequest.state) {
       redirectUrl.searchParams.set("state", consentRequest.state);
     }
@@ -684,13 +701,28 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
 
     // AFTER setAuthCode: the code exists in the database by this line, so the
     // row cannot claim a grant that then failed to persist.
+    //
+    // A loopback redirect_uri (RFC 8252 §7.3) means an installed client is
+    // waiting for the code on loopback. On a headless gateway the browser that
+    // approved consent is a different machine from the one running that
+    // listener, so the bare 302 below lands on a dead localhost port. For that
+    // case render a success page that both attempts the completion and shows
+    // the code to copy; non-loopback redirects (claude.ai, Claude Desktop) are
+    // untouched and keep the 302. httpStatus on the audit row reflects the real
+    // response so the two branches stay distinguishable after the fact.
+    const loopback = isLoopbackRedirectUri(consentRequest.redirect_uri);
+
     emitConsentDecision(req, {
       granted: true,
       userId,
       clientId: consentRequest.client_id,
       redirectUri: consentRequest.redirect_uri,
-      httpStatus: 302,
+      httpStatus: loopback ? 200 : 302,
     });
+
+    if (loopback) {
+      return sendLoopbackConsentSuccess(res, redirectUrl);
+    }
 
     res.redirect(redirectUrl.toString());
   } catch (error) {
@@ -771,6 +803,14 @@ authorizationRouter.get("/oauth/callback", async (req, res) => {
 
       // Code exists and is valid, redirect back to the original redirect_uri
       const redirectUrl = new URL(codeData.redirect_uri);
+      // RFC 9207: the metadata advertises
+      // authorization_response_iss_parameter_supported, so EVERY
+      // code-bearing authorization response must carry the issuer, this
+      // legacy forwarder included, or a client that validates iss rejects
+      // the code it just received. Through getIssuerIdentifier, the same
+      // helper the AS metadata `issuer` and the consent-decision redirect
+      // use, so the three can never disagree.
+      redirectUrl.searchParams.set("iss", getIssuerIdentifier(req));
       redirectUrl.searchParams.set("code", code as string);
       if (state) {
         redirectUrl.searchParams.set("state", state as string);

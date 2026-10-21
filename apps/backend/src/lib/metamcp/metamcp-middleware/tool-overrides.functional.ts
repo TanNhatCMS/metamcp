@@ -14,6 +14,7 @@ import {
   CallToolMiddleware,
   ListToolsMiddleware,
 } from "./functional-middleware";
+import { findNamespaceServerUuidsByName } from "./namespace-server-lookup";
 
 /**
  * Configuration for the tool overrides middleware
@@ -59,7 +60,7 @@ function mergeAnnotations(
  */
 class ToolOverridesCache {
   private overrideCache = new Map<string, ToolOverride>();
-  private reverseNameCache = new Map<string, string>(); // overrideName -> originalName
+  private reverseNameCache = new Map<string, string>(); // (server, overrideName) -> originalName
   private expiry = new Map<string, number>();
   private persistentKeys = new Set<string>(); // keys that never expire
   private ttl: number;
@@ -76,8 +77,24 @@ class ToolOverridesCache {
     return `${namespaceUuid}:${serverName}:${toolName}`;
   }
 
-  private getReverseKey(namespaceUuid: string, overrideName: string): string {
-    return `${namespaceUuid}:${overrideName}`;
+  /**
+   * The reverse key carries the SERVER as well as the override name, because
+   * an override name is only unique per server: two servers in one namespace
+   * may give different tools the same alias. Keyed by namespace and alias
+   * alone, the first server to cache an alias answered for every server, so a
+   * call to `serverB__X` was routed to serverA's tool once serverA's `X` was
+   * cached (the database path below always checked the server; only the cache
+   * hit did not). The server and alias are JSON-encoded so a name containing
+   * the `:` separator cannot make two different pairs share a key; the
+   * `${namespaceUuid}:` prefix stays plain so `clear(namespaceUuid)` still
+   * matches it.
+   */
+  private getReverseKey(
+    namespaceUuid: string,
+    serverName: string,
+    overrideName: string,
+  ): string {
+    return `${namespaceUuid}:${JSON.stringify([serverName, overrideName])}`;
   }
 
   get(
@@ -125,23 +142,37 @@ class ToolOverridesCache {
     if (override.overrideName) {
       const reverseKey = this.getReverseKey(
         namespaceUuid,
+        serverName,
         override.overrideName,
       );
       this.reverseNameCache.set(reverseKey, `${serverName}__${toolName}`);
     }
   }
 
-  getOriginalName(namespaceUuid: string, overrideName: string): string | null {
-    const reverseKey = this.getReverseKey(namespaceUuid, overrideName);
+  getOriginalName(
+    namespaceUuid: string,
+    serverName: string,
+    overrideName: string,
+  ): string | null {
+    const reverseKey = this.getReverseKey(
+      namespaceUuid,
+      serverName,
+      overrideName,
+    );
     return this.reverseNameCache.get(reverseKey) || null;
   }
 
   setOriginalName(
     namespaceUuid: string,
+    serverName: string,
     overrideName: string,
     originalName: string,
   ): void {
-    const reverseKey = this.getReverseKey(namespaceUuid, overrideName);
+    const reverseKey = this.getReverseKey(
+      namespaceUuid,
+      serverName,
+      overrideName,
+    );
     this.reverseNameCache.set(reverseKey, originalName);
   }
 
@@ -190,15 +221,29 @@ async function getToolOverrides(
   }
 
   try {
-    // Get server UUID by name
-    const [server] = await db
-      .select({ uuid: mcpServersTable.uuid })
-      .from(mcpServersTable)
-      .where(eq(mcpServersTable.name, serverName));
+    // The server this prefix means IN THIS NAMESPACE (upstream
+    // metatool-ai/metamcp#364, see namespace-server-lookup.ts). Resolved by
+    // name alone, the lookup could land on another owner's same-named server,
+    // find no mapping row there, and silently drop this namespace's override.
+    const serverUuids = await findNamespaceServerUuidsByName(
+      namespaceUuid,
+      serverName,
+    );
 
-    if (!server) {
+    if (serverUuids.length !== 1) {
+      if (serverUuids.length > 1) {
+        // Two mounted servers share the name, so which one's override applies
+        // cannot be told from the prefix; the routing maps already warn about
+        // the collision. Apply none rather than pick by heap order: the tool
+        // then shows under its real name, and the filter judges it against
+        // both servers.
+        logger.warn(
+          `Tool overrides skipped for ${serverName}__${toolName} in namespace ${namespaceUuid}: ${serverUuids.length} mounted servers share the name "${serverName}"`,
+        );
+      }
       return null;
     }
+    const server = { uuid: serverUuids[0] };
 
     // Query database for tool overrides
     const [toolMapping] = await db
@@ -346,6 +391,7 @@ async function applyToolOverrides(
         if (override.overrideName && useCache) {
           toolOverridesCache.setOriginalName(
             namespaceUuid,
+            parsed.serverName,
             override.overrideName,
             tool.name,
           );
@@ -378,10 +424,12 @@ export async function mapOverrideNameToOriginal(
     return toolName;
   }
 
-  // First check if this might be an override name using just the tool part
+  // First check if this might be an override name ON THIS SERVER (the server
+  // prefix is part of the key; see getReverseKey)
   if (useCache) {
     const originalName = toolOverridesCache.getOriginalName(
       namespaceUuid,
+      parsed.serverName,
       parsed.originalToolName,
     );
     if (originalName) {
@@ -416,10 +464,11 @@ export async function mapOverrideNameToOriginal(
     if (toolMapping) {
       const originalFullName = `${toolMapping.serverName}__${toolMapping.originalName}`;
 
-      // Cache the reverse mapping using the tool part only
+      // Cache the reverse mapping under the server prefix and the tool part
       if (useCache) {
         toolOverridesCache.setOriginalName(
           namespaceUuid,
+          parsed.serverName,
           parsed.originalToolName,
           originalFullName,
         );

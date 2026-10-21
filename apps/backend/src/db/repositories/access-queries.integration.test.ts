@@ -187,32 +187,38 @@ async function seed() {
   await db.insert(schema.oauthAccessTokensTable).values([
     {
       access_token: "itest-access-live",
+      access_token_last4: "live",
       client_id: CLIENT_ID,
       user_id: MEMBER_ID,
       scope: "mcp",
       expires_at: future(12 * HOUR),
       refresh_token: "itest-refresh-live",
       refresh_token_expires_at: future(30 * 24 * HOUR),
+      family_id: "aaaaaaaa-0000-0000-0000-000000000001",
       created_at: past(HOUR),
     },
     {
       access_token: "itest-access-norefresh",
+      access_token_last4: "resh",
       client_id: CLIENT_ID,
       user_id: MEMBER_ID,
       scope: "mcp",
       expires_at: future(6 * HOUR),
       refresh_token: null,
       refresh_token_expires_at: null,
+      family_id: "aaaaaaaa-0000-0000-0000-000000000002",
       created_at: past(2 * HOUR),
     },
     {
       // Expired: excluded from the listing and from the live count.
       access_token: "itest-access-expired",
+      access_token_last4: "ired",
       client_id: CLIENT_ID,
       user_id: MEMBER_ID,
       scope: "mcp",
       expires_at: past(HOUR),
       refresh_token: null,
+      family_id: "aaaaaaaa-0000-0000-0000-000000000003",
       created_at: past(48 * HOUR),
     },
   ]);
@@ -395,6 +401,13 @@ describeIfDb("listActiveAccessTokens against real postgres", () => {
     expect(serialized.map((t) => t.has_refresh_token).sort()).toEqual([
       false,
       true,
+    ]);
+
+    // The readable tail is surfaced (migration 0036); the two live rows carry
+    // their last4 and the expired one is excluded.
+    expect(serialized.map((t) => t.access_token_last4).sort()).toEqual([
+      "live",
+      "resh",
     ]);
 
     const payload = JSON.stringify(serialized);

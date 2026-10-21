@@ -2,6 +2,12 @@ import { betterFetch } from "@better-fetch/fetch";
 import { NextRequest, NextResponse } from "next/server";
 
 import { SUPPORTED_LOCALES, SupportedLocale } from "@/lib/i18n";
+import { consentFormActionSources } from "./lib/consent-form-action";
+import { shouldBypassMiddleware } from "./lib/middleware-bypass";
+import {
+  buildContentSecurityPolicy,
+  NONCE_HEADER,
+} from "./lib/security-headers";
 
 const locales = [...SUPPORTED_LOCALES];
 const defaultLocale = "en";
@@ -71,28 +77,48 @@ function loginRedirect(
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
-  // Skip middleware for static files and API routes
-  if (
-    pathname.startsWith("/_next") ||
-    pathname.startsWith("/api/") ||
-    pathname.startsWith("/trpc") ||
-    pathname.startsWith("/mcp-proxy") ||
-    pathname.startsWith("/metamcp") ||
-    pathname.startsWith("/oauth") ||
-    pathname.startsWith("/.well-known") ||
-    pathname.startsWith("/service") ||
-    pathname.startsWith("/health") ||
-    pathname.startsWith("/fe-oauth") ||
-    // Umbrella fork: M365 broker routes live on the backend behind a
-    // next.config.js rewrite; without this skip the i18n branch 307s
-    // /m365/* to /en/m365/* before the rewrite runs (Entra redirects
-    // to the EXACT registered callback URI, so that redirect breaks
-    // enrollment).
-    pathname.startsWith("/m365") ||
-    pathname.includes(".")
-  ) {
+  // Skip middleware for static files and the backend/framework routes. The
+  // bypass set and its segment-boundary matching live in ./lib/middleware-bypass
+  // so the config.matcher below stays in lockstep with it (see that module for
+  // why bare-prefix matching swallowed the same-prefix /oauth-clients page).
+  if (shouldBypassMiddleware(pathname)) {
     return NextResponse.next();
   }
+
+  // Per-request CSP nonce. The policy bans inline script except by nonce, and a
+  // nonce cannot be a static next.config value, so it is minted here, the only
+  // layer that runs before the document is rendered. It is stamped on the
+  // request's CSP header (Next reads it there to nonce the framework hydration
+  // scripts) and on `x-nonce` (the root layout reads it there to nonce the
+  // third-party inline scripts Next does not own: the runtime-env script and
+  // the theme anti-flash script). See ./lib/security-headers.
+  const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
+  // The consent document alone widens form-action to its redirect_uri origin:
+  // its Approve is a form POST whose success response is a 302 to the client,
+  // and Chromium enforces form-action on that redirect (see
+  // ./lib/consent-form-action for the failure this closes). Every other page
+  // keeps `form-action 'self'`.
+  const csp = buildContentSecurityPolicy(nonce, {
+    formActionSources: consentFormActionSources(
+      pathname,
+      request.nextUrl.searchParams.get("areq"),
+    ),
+  });
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set(NONCE_HEADER, nonce);
+  requestHeaders.set("Content-Security-Policy", csp);
+
+  // A document render: carry the nonce forward to the renderer via the request
+  // headers, and the policy back to the browser on the response. Only the
+  // page-rendering branches below use this; the redirect branches return a
+  // bodyless 307 whose destination gets its own pass through this middleware.
+  const renderDocument = () => {
+    const response = NextResponse.next({
+      request: { headers: requestHeaders },
+    });
+    response.headers.set("Content-Security-Policy", csp);
+    return response;
+  };
 
   // Handle i18n routing first
   const pathnameHasLocale = locales.some(
@@ -114,10 +140,15 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(newUrl);
   }
 
-  // Now handle authentication for the pathname without locale
-  const publicRoutes = ["/login", "/register", "/", "/cors-error"];
+  // Now handle authentication for the pathname without locale.
+  // "/" is deliberately NOT public: an unauthenticated visitor to the root
+  // should be redirected to /login rather than served the dashboard shell,
+  // which then fires a 401 on every data query. Leaving it out routes the root
+  // through the session check below like any other protected page, so an
+  // authenticated user still gets the dashboard and everyone else gets login.
+  const publicRoutes = ["/login", "/register", "/cors-error"];
   if (publicRoutes.includes(pathnameWithoutLocale)) {
-    return NextResponse.next();
+    return renderDocument();
   }
 
   try {
@@ -149,7 +180,7 @@ export async function middleware(request: NextRequest) {
       );
     }
 
-    return NextResponse.next();
+    return renderDocument();
   } catch (error) {
     console.error("Auth middleware error:", error);
     // On error, redirect to login (with locale)
@@ -161,7 +192,12 @@ export async function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
-    // Skip all internal paths (_next, etc.)
-    "/((?!_next|api/|trpc|mcp-proxy|metamcp|oauth|fe-oauth|\\.well-known|service|health|m365|.*\\..*).*)",
+    // Skip all internal paths (_next, etc.). Each prefix is matched on a segment
+    // boundary ((?:/|$)) so a page whose route merely shares a prefix (e.g.
+    // /oauth-clients vs the bypassed /oauth) is NOT skipped. Keep this in
+    // lockstep with shouldBypassMiddleware in ./lib/middleware-bypass. Next
+    // requires config.matcher to be a statically-analyzable literal, so it
+    // cannot import that list; middleware-bypass.test.ts cross-checks the two.
+    "/((?!_next(?:/|$)|api/|trpc(?:/|$)|mcp-proxy(?:/|$)|metamcp(?:/|$)|oauth(?:/|$)|fe-oauth(?:/|$)|\\.well-known(?:/|$)|service(?:/|$)|health(?:/|$)|m365(?:/|$)|.*\\..*).*)",
   ],
 };

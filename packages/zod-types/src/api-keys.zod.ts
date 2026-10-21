@@ -23,17 +23,17 @@ const actsAsShape = {
   acts_as_user_id: z.string().min(1).optional(),
 };
 
-// Base API Key schemas
-export const ApiKeySchema = z.object({
-  uuid: z.string().uuid(),
-  name: z.string(),
-  key: z.string(),
-  user_id: z.string().nullable(),
-  endpoint_uuid: z.string().uuid().nullable(),
-  acts_as_user_id: z.string().nullable(),
-  created_at: z.date(),
-  is_active: z.boolean(),
-});
+// Plane flag (migration 0038): true mints a CONTROL-plane (admin-plane / CI)
+// key that authenticates on /trpc as its owner, false/absent a DATA-plane key.
+// Admin-only, creation-only, and MUTUALLY EXCLUSIVE with every data-plane input
+// (endpoint scope + acts-as), a control-plane key has no endpoint to reach and
+// carries no delegated identity. The superRefines below reject that combination
+// and relax the mandatory-scope rule for admin-plane keys (they have no endpoint
+// to name); the admin-only and owner-must-be-admin policy lives in the impl,
+// the only layer that sees the caller's and the owner's role.
+const adminPlaneShape = {
+  admin_plane: z.boolean().optional(),
+};
 
 export const CreateApiKeyFormSchema = z
   .object({
@@ -48,8 +48,32 @@ export const CreateApiKeyFormSchema = z
     user_id: z.string().nullable().optional(),
     ...scopeShape,
     ...actsAsShape,
+    ...adminPlaneShape,
   })
   .superRefine((val, ctx) => {
+    // Admin-plane (control-plane / CI) key: a separate population with NO
+    // data-plane scope. It authenticates a user on /trpc, never reaches an
+    // endpoint, and carries no acts-as identity, so the three data-plane inputs
+    // must be absent and the mandatory-scope rule below is skipped for it (it
+    // has no endpoint to name). Admin-only and owner-must-be-admin are enforced
+    // in the impl, the only layer that sees the caller's and owner's role.
+    if (val.admin_plane === true) {
+      if (val.endpoint_uuid !== undefined || val.all_endpoints !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noScope",
+        });
+      }
+      if (val.acts_as_user_id !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noActsAs",
+        });
+      }
+      return;
+    }
     if (val.endpoint_uuid && val.all_endpoints === true) {
       ctx.addIssue({
         code: "custom",
@@ -107,8 +131,32 @@ export const CreateApiKeyRequestSchema = z
     user_id: z.string().nullable().optional(),
     ...scopeShape,
     ...actsAsShape,
+    ...adminPlaneShape,
   })
   .superRefine((val, ctx) => {
+    // Admin-plane (control-plane / CI) key: a separate population with NO
+    // data-plane scope. It authenticates a user on /trpc, never reaches an
+    // endpoint, and carries no acts-as identity, so the three data-plane inputs
+    // must be absent and the mandatory-scope rule below is skipped for it (it
+    // has no endpoint to name). Admin-only and owner-must-be-admin are enforced
+    // in the impl, the only layer that sees the caller's and owner's role.
+    if (val.admin_plane === true) {
+      if (val.endpoint_uuid !== undefined || val.all_endpoints !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noScope",
+        });
+      }
+      if (val.acts_as_user_id !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noActsAs",
+        });
+      }
+      return;
+    }
     if (val.endpoint_uuid && val.all_endpoints === true) {
       ctx.addIssue({
         code: "custom",
@@ -243,13 +291,85 @@ export const AdminApiKeyItemSchema = z.object({
   // so the admin view labels identity-bound keys loudly.
   acts_as_user_id: z.string().nullable(),
   acts_as_email: z.string().nullable(),
+  // Plane flag (migration 0038): true labels a control-plane (admin-plane / CI)
+  // key loudly in the admin view, the way acts-as is labelled. A boolean, not
+  // credential material, so it is safe in a list.
+  admin_plane: z.boolean(),
   created_at: z.date(),
   last_used_at: z.date().nullable(),
   is_active: z.boolean(),
+  // IP allowlist (migration 0041). allowed_cidrs NULL = the key follows the
+  // global policy; non-NULL = its own list, governed by its own
+  // ip_policy_mode. last_used_ip is the CF-Connecting-IP of the key's last
+  // authenticated request (throttled like last_used_at). None of the three is
+  // credential material.
+  allowed_cidrs: z.array(z.string()).nullable(),
+  ip_policy_mode: z.enum(["off", "audit", "enforce"]),
+  last_used_ip: z.string().nullable(),
 });
 
 export const ListAllApiKeysResponseSchema = z.object({
   apiKeys: z.array(AdminApiKeyItemSchema),
+});
+
+// ---- API-key IP allowlists (migration 0041) ----
+//
+// off: nothing is evaluated. audit: the request is served and a throttled
+// would-deny audit row is written. enforce: the request is refused with 403.
+export const IpPolicyModeSchema = z.enum(["off", "audit", "enforce"]);
+
+// Shape only. CIDR syntax (IPv4 or IPv6, prefix in range, no host bits set) is
+// checked on the server with node:net, which is also what evaluates the list,
+// so the rule that accepts an entry and the rule that matches it are the same
+// code. 64 characters covers the longest legitimate IPv6 CIDR (49), and 100
+// entries per list is far above any real allowlist.
+export const IpCidrListSchema = z
+  .array(z.string().trim().min(1).max(64))
+  .max(100);
+
+// Set ONE key's policy. allowed_cidrs null returns the key to the global
+// policy (ip_policy_mode must then be "off", since a per-key mode without a
+// per-key list is never read). The any-IP exemption is
+// ["0.0.0.0/0", "::/0"].
+export const SetApiKeyIpPolicyRequestSchema = z.object({
+  uuid: z.string().uuid(),
+  allowed_cidrs: IpCidrListSchema.nullable(),
+  ip_policy_mode: IpPolicyModeSchema,
+});
+
+// Readback of the written row: the policy as stored (canonicalised CIDRs), so
+// a caller can confirm the write without a second query. No credential
+// material, same as the list surfaces.
+export const SetApiKeyIpPolicyResponseSchema = z.object({
+  uuid: z.string().uuid(),
+  name: z.string(),
+  key_prefix: z.string(),
+  is_active: z.boolean(),
+  allowed_cidrs: z.array(z.string()).nullable(),
+  ip_policy_mode: IpPolicyModeSchema,
+  last_used_ip: z.string().nullable(),
+});
+
+// The global policy, applied to every key whose allowed_cidrs is NULL.
+export const SetGlobalIpPolicyRequestSchema = z.object({
+  mode: IpPolicyModeSchema,
+  allowed_cidrs: IpCidrListSchema,
+});
+
+export const SetGlobalIpPolicyResponseSchema = z.object({
+  mode: IpPolicyModeSchema,
+  allowed_cidrs: z.array(z.string()),
+});
+
+// `problems` names stored values the evaluator could not read (a value
+// written outside the app); each is handled fail-closed and is listed here so
+// an administrator sees it. `kill_switch_active` reports
+// API_KEY_IP_POLICY_DISABLED=true, under which nothing is evaluated at all.
+export const GetGlobalIpPolicyResponseSchema = z.object({
+  mode: IpPolicyModeSchema,
+  allowed_cidrs: z.array(z.string()),
+  problems: z.array(z.string()),
+  kill_switch_active: z.boolean(),
 });
 
 export const ValidateApiKeyRequestSchema = z.object({
@@ -279,6 +399,11 @@ export const ApiKeyCreateInputSchema = z.object({
   // tRPC create path enforces admin-only + requires-endpoint-scope; at the
   // repository layer the column is just nullable.
   acts_as_user_id: z.string().nullable().optional(),
+  // Plane flag (migration 0038). Optional (not defaulted) so it stays absent
+  // from the inferred input type and existing data-plane callers need not pass
+  // it; the repository persists `admin_plane ?? false`. The tRPC create path
+  // owns the admin-only + owner-must-be-admin + plane-exclusivity policy.
+  admin_plane: z.boolean().optional(),
   is_active: z.boolean().optional().default(true),
 });
 
@@ -288,7 +413,6 @@ export const ApiKeyUpdateInputSchema = z.object({
 });
 
 // Type exports
-export type ApiKey = z.infer<typeof ApiKeySchema>;
 export type CreateApiKeyForm = z.infer<typeof CreateApiKeyFormSchema>;
 export type CreateApiKeyRequest = z.infer<typeof CreateApiKeyRequestSchema>;
 export type CreateApiKeyResponse = z.infer<typeof CreateApiKeyResponseSchema>;
@@ -307,3 +431,19 @@ export type ValidateApiKeyResponse = z.infer<
 >;
 export type ApiKeyCreateInput = z.infer<typeof ApiKeyCreateInputSchema>;
 export type ApiKeyUpdateInput = z.infer<typeof ApiKeyUpdateInputSchema>;
+export type IpPolicyMode = z.infer<typeof IpPolicyModeSchema>;
+export type SetApiKeyIpPolicyRequest = z.infer<
+  typeof SetApiKeyIpPolicyRequestSchema
+>;
+export type SetApiKeyIpPolicyResponse = z.infer<
+  typeof SetApiKeyIpPolicyResponseSchema
+>;
+export type SetGlobalIpPolicyRequest = z.infer<
+  typeof SetGlobalIpPolicyRequestSchema
+>;
+export type SetGlobalIpPolicyResponse = z.infer<
+  typeof SetGlobalIpPolicyResponseSchema
+>;
+export type GetGlobalIpPolicyResponse = z.infer<
+  typeof GetGlobalIpPolicyResponseSchema
+>;

@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import logger from "@/utils/logger";
 
 import { runWithCallerContext } from "../caller-context-store";
+import { metamcpLogStore } from "../log-store";
+import { ToolArgSchemaRegistry } from "../tool-arg-keys";
 import {
   createAuditingMiddleware,
   setAuditRecorderForTesting,
 } from "./auditing.functional";
 import { MetaMCPHandlerContext } from "./functional-middleware";
+import { markRetiredToolResult } from "./retired-tool-marker";
 
 const context: MetaMCPHandlerContext = {
   namespaceUuid: "ns-123",
@@ -20,6 +25,30 @@ const context: MetaMCPHandlerContext = {
   callerIp: "203.0.113.7",
   requestId: "req-aaaa",
 };
+
+// The audit stores only names the tool's own schema declares (tool-arg-keys.ts).
+// Every request below calls autotask__search, declared here as a listing would.
+const toolArgSchemas = new ToolArgSchemaRegistry();
+const auditing = () =>
+  createAuditingMiddleware((name) => toolArgSchemas.get(name));
+beforeEach(() => {
+  toolArgSchemas.replace([
+    {
+      name: "autotask__search",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: { enum: ["note_add", "list"] },
+          ticket: {},
+          note: {},
+          action: { enum: ["run_script"] },
+          identifier: {},
+          company: {},
+        },
+      },
+    },
+  ]);
+});
 
 const makeRequest = (args?: Record<string, unknown>): CallToolRequest =>
   ({
@@ -43,7 +72,7 @@ describe("auditing middleware DB write-through", () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await wrapped(makeRequest({ q: "printer" }), context);
     await flush();
 
@@ -64,7 +93,7 @@ describe("auditing middleware DB write-through", () => {
     setAuditRecorderForTesting(recorder);
     const args = { password: "hunter2-super-secret" };
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await wrapped(makeRequest(args), context);
     await flush();
 
@@ -79,7 +108,7 @@ describe("auditing middleware DB write-through", () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await wrapped(makeRequest(undefined), context);
     await flush();
 
@@ -93,7 +122,7 @@ describe("auditing middleware DB write-through", () => {
       .fn()
       .mockRejectedValue(Object.assign(new Error("boom"), { code: -32602 }));
 
-    const wrapped = createAuditingMiddleware()(failing);
+    const wrapped = auditing()(failing);
     await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toThrow(
       "boom",
     );
@@ -109,7 +138,7 @@ describe("auditing middleware DB write-through", () => {
     setAuditRecorderForTesting(recorder);
     const failing = vi.fn().mockRejectedValue(new TypeError("bad shape"));
 
-    const wrapped = createAuditingMiddleware()(failing);
+    const wrapped = auditing()(failing);
     await expect(wrapped(makeRequest(), context)).rejects.toThrow("bad shape");
     await flush();
 
@@ -119,7 +148,7 @@ describe("auditing middleware DB write-through", () => {
   it("never fails the tool call when the audit write rejects", async () => {
     setAuditRecorderForTesting(vi.fn().mockRejectedValue(new Error("db down")));
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     const result = await wrapped(makeRequest({ a: 1 }), context);
     await flush();
 
@@ -129,7 +158,7 @@ describe("auditing middleware DB write-through", () => {
   it("is inert when persistence is disabled (recorder=null)", async () => {
     setAuditRecorderForTesting(null);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     const result = await wrapped(makeRequest({ a: 1 }), context);
     await flush();
 
@@ -143,7 +172,7 @@ describe("caller binding (migration 0030)", () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await wrapped(makeRequest({ q: "printer" }), context);
     await flush();
 
@@ -164,7 +193,7 @@ describe("caller binding (migration 0030)", () => {
       .fn()
       .mockRejectedValue(Object.assign(new Error("denied"), { code: -32602 }));
 
-    const wrapped = createAuditingMiddleware()(failing);
+    const wrapped = auditing()(failing);
     await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toThrow(
       "denied",
     );
@@ -189,7 +218,7 @@ describe("caller binding (migration 0030)", () => {
       sessionId: "sess-456",
     };
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     const result = await wrapped(makeRequest({ a: 1 }), bare);
     await flush();
 
@@ -212,7 +241,7 @@ describe("caller binding (migration 0030)", () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await wrapped(makeRequest({ a: 1 }), { ...context, requestId: "req-one" });
     await wrapped(makeRequest({ a: 2 }), { ...context, requestId: "req-two" });
     await flush();
@@ -249,7 +278,7 @@ describe("caller binding — request-scoped store wins over the pooled context",
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await runWithCallerContext(
       {
         clientName: "live consumer",
@@ -282,7 +311,7 @@ describe("caller binding — request-scoped store wins over the pooled context",
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await runWithCallerContext(
       { authMethod: "session", userId: "admin-1" },
       () => wrapped(makeRequest({ a: 1 }), stale),
@@ -302,7 +331,7 @@ describe("caller binding — request-scoped store wins over the pooled context",
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await wrapped(makeRequest({ a: 1 }), stale);
     await flush();
 
@@ -315,7 +344,7 @@ describe("caller binding — request-scoped store wins over the pooled context",
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await runWithCallerContext(
       {
         apiKeyUuid: "3f7f8a1e-0000-4000-8000-00000000000c",
@@ -347,7 +376,7 @@ describe("a refused or failing call must not read as a successful one", () => {
       content: [{ type: "text", text: 'Access denied to tool "search"' }],
     });
 
-    const wrapped = createAuditingMiddleware()(denied);
+    const wrapped = auditing()(denied);
     const result = await wrapped(makeRequest({ a: 1 }), context);
     await flush();
 
@@ -364,12 +393,518 @@ describe("a refused or failing call must not read as a successful one", () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
 
-    const wrapped = createAuditingMiddleware()(okHandler);
+    const wrapped = auditing()(okHandler);
     await wrapped(makeRequest({ a: 1 }), context);
     await flush();
 
     const entry = recorder.mock.calls[0][0];
     expect(entry.success).toBe(true);
     expect(entry.error_code).toBeUndefined();
+  });
+});
+
+describe("args_shape (migration 0039)", () => {
+  it("a path without a listing resolver stores counts even if another proxy knows the name", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    await createAuditingMiddleware()(okHandler)(
+      makeRequest({ mode: "Alice_Smith", ticket: 1 }),
+      context,
+    );
+    await flush();
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 2,
+    });
+  });
+
+  it("an unlisted tool name stores counts only, never caller-chosen names", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const wrapped = auditing()(okHandler);
+    await wrapped(
+      {
+        method: "tools/call",
+        params: {
+          name: "autotask__unlisted",
+          arguments: { mode: "x", Alice_Smith: 1 },
+        },
+      } as CallToolRequest,
+      context,
+    );
+    await flush();
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 2,
+    });
+  });
+
+  it("records the shape on a success row, never the values", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = auditing()(okHandler);
+    await wrapped(
+      makeRequest({ mode: "note_add", ticket: 123, note: { text: "secret" } }),
+      context,
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.args_shape).toEqual({
+      sel: { mode: "note_add" },
+      keys: ["mode", "note", "ticket"],
+    });
+    expect(JSON.stringify(entry.args_shape)).not.toMatch(/secret|123/);
+  });
+
+  it("records the shape on a failure row (thrown error) too", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failing = vi.fn().mockRejectedValue(new Error("boom"));
+
+    const wrapped = auditing()(failing);
+    await expect(
+      wrapped(makeRequest({ action: "run_script", identifier: "d1" }), context),
+    ).rejects.toThrow("boom");
+    await flush();
+
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      sel: { action: "run_script" },
+      keys: ["action", "identifier"],
+    });
+  });
+
+  it("records an empty shape (not null) for a call with no arguments", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = auditing()(okHandler);
+    await wrapped(makeRequest(undefined), context);
+    await flush();
+
+    // `params_hash` is null for this call, but the shape is still recorded:
+    // args_shape IS NOT NULL is the marker for "a post-0039 row".
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({ keys: [] });
+  });
+
+  it("is computed from the ORIGINAL arguments even when an inner middleware rewrites the request", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const rewriting = vi.fn().mockImplementation(async (request) => {
+      // An inner layer (the override middleware builds a new request) may
+      // mutate what it was handed; the audit shape was taken at entry.
+      request.params.arguments = { rewritten: true };
+      return { content: [] };
+    });
+
+    const wrapped = auditing()(rewriting);
+    await wrapped(makeRequest({ mode: "list", company: "c1" }), context);
+    await flush();
+
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      sel: { mode: "list" },
+      keys: ["company", "mode"],
+    });
+  });
+
+  describe("kill switch", () => {
+    const saved = process.env.TOOL_AUDIT_ARGS_SHAPE;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.TOOL_AUDIT_ARGS_SHAPE;
+      else process.env.TOOL_AUDIT_ARGS_SHAPE = saved;
+    });
+
+    it("stores NULL when TOOL_AUDIT_ARGS_SHAPE=off and still records the row", async () => {
+      process.env.TOOL_AUDIT_ARGS_SHAPE = "off";
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+
+      const wrapped = auditing()(okHandler);
+      await wrapped(makeRequest({ mode: "list" }), context);
+      await flush();
+
+      const entry = recorder.mock.calls[0][0];
+      expect(entry.args_shape).toBeNull();
+      expect(entry.success).toBe(true);
+      expect(entry.params_hash).not.toBeNull();
+    });
+  });
+
+  it("never fails the call when the arguments cannot be read", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    // A plain-object Proxy whose key enumeration throws: the one input a JSON
+    // parser cannot produce but that proves the guard is in place.
+    const hostile = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error("hostile");
+        },
+      },
+    );
+
+    const wrapped = auditing()(okHandler);
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const result = await wrapped(
+      makeRequest(hostile as Record<string, unknown>),
+      context,
+    );
+    await flush();
+
+    expect(result).toEqual({ content: [] });
+    expect(recorder.mock.calls[0][0].args_shape).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(
+      "Audit argument shape fault",
+    );
+    expect(String(warn.mock.calls[0][0])).not.toContain("hostile");
+    warn.mockRestore();
+  });
+});
+
+describe("in-band classification (migration 0039 error_detail)", () => {
+  const inbandBody = {
+    error: true,
+    code: "invalid_input",
+    message: "mode is not allowed here",
+  };
+  const inbandResult = () => ({
+    content: [{ type: "text", text: JSON.stringify(inbandBody) }],
+    structuredContent: { ...inbandBody },
+  });
+  const handlerReturning = (result: unknown) =>
+    vi.fn().mockResolvedValue(result);
+
+  it("records an in-band refusal as failed, inband_error, with the tool's code", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = auditing()(handlerReturning(inbandResult()));
+    await wrapped(makeRequest({ mode: "list", company: "c1" }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("inband_error");
+    expect(entry.error_detail).toBe("invalid_input");
+    expect(entry.args_shape).toEqual({
+      sel: { mode: "list" },
+      keys: ["company", "mode"],
+    });
+  });
+
+  it("returns the IDENTICAL object it received, for failed, in-band and success results", async () => {
+    setAuditRecorderForTesting(vi.fn().mockResolvedValue(undefined));
+    const results = [
+      { isError: true, content: [{ type: "text", text: "denied" }] },
+      inbandResult(),
+      { content: [{ type: "text", text: "ok" }] },
+      markRetiredToolResult(
+        { isError: true, content: [{ type: "text", text: "retired" }] },
+        { replacement: "a__b" },
+      ),
+    ];
+    for (const result of results) {
+      const wrapped = auditing()(handlerReturning(result));
+      const returned = await wrapped(makeRequest({ a: 1 }), context);
+      // toBe, not toEqual: the wire must be unchanged, so it is the same object.
+      expect(returned).toBe(result);
+    }
+  });
+
+  it("does not mutate a deep-frozen in-band result", async () => {
+    setAuditRecorderForTesting(vi.fn().mockResolvedValue(undefined));
+    const frozen = Object.freeze({
+      content: Object.freeze([
+        Object.freeze({ type: "text", text: JSON.stringify(inbandBody) }),
+      ]),
+      structuredContent: Object.freeze({ ...inbandBody }),
+    });
+    const wrapped = auditing()(handlerReturning(frozen));
+    await expect(wrapped(makeRequest({ a: 1 }), context)).resolves.toBe(frozen);
+  });
+
+  it("a success with error:null stays a success", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ok = {
+      content: [],
+      structuredContent: { status: "dispatched", error: null },
+    };
+
+    const wrapped = auditing()(handlerReturning(ok));
+    await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(true);
+    expect(entry.error_code).toBeUndefined();
+    expect(entry.error_detail).toBeUndefined();
+  });
+
+  it("records a retired-name redirect as tool_retired", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const redirect = markRetiredToolResult(
+      { isError: true, content: [{ type: "text", text: "retired" }] },
+      { replacement: "autotask__ticket_manage" },
+    );
+
+    const wrapped = auditing()(handlerReturning(redirect));
+    await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("tool_retired");
+    expect(entry.server_name).toBe("autotask");
+  });
+
+  it("records an isError 'Unknown tool' result as unknown_tool", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const unknown = {
+      isError: true,
+      content: [{ type: "text", text: "Unknown tool: 'add_note'" }],
+    };
+
+    const wrapped = auditing()(handlerReturning(unknown));
+    await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    expect(recorder.mock.calls[0][0].error_code).toBe("unknown_tool");
+  });
+
+  it("records a thrown 'Unknown tool' as unknown_tool and still rethrows it", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failing = vi.fn().mockRejectedValue(new Error("Unknown tool: x__y"));
+
+    const wrapped = auditing()(failing);
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toThrow(
+      "Unknown tool: x__y",
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("unknown_tool");
+  });
+
+  it("any other thrown error keeps its original class", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const timeout = Object.assign(new Error("Request timed out"), {
+      code: -32001,
+    });
+
+    const wrapped = auditing()(vi.fn().mockRejectedValue(timeout));
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toBe(timeout);
+    await flush();
+
+    expect(recorder.mock.calls[0][0].error_code).toBe("-32001");
+  });
+
+  it("preserves an opaque thrown failure when unknown-tool classification cannot read its message", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failure = {
+      code: -32001,
+      get message() {
+        throw new Error("private-fault-data");
+      },
+    };
+    const wrapped = auditing()(vi.fn().mockRejectedValue(failure));
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toBe(failure);
+    await flush();
+    expect(recorder.mock.calls[0][0].error_code).toBe("-32001");
+  });
+
+  describe("kill switch", () => {
+    const saved = process.env.TOOL_AUDIT_INBAND_CLASSIFY;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.TOOL_AUDIT_INBAND_CLASSIFY;
+      else process.env.TOOL_AUDIT_INBAND_CLASSIFY = saved;
+    });
+
+    it("off makes an in-band error a success again but leaves isError handling intact", async () => {
+      process.env.TOOL_AUDIT_INBAND_CLASSIFY = "off";
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+
+      await auditing()(handlerReturning(inbandResult()))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+      await auditing()(
+        handlerReturning({
+          isError: true,
+          content: [{ type: "text", text: "denied" }],
+        }),
+      )(makeRequest({ a: 1 }), context);
+      await flush();
+
+      expect(recorder.mock.calls[0][0].success).toBe(true);
+      expect(recorder.mock.calls[0][0].error_code).toBeUndefined();
+      expect(recorder.mock.calls[1][0].success).toBe(false);
+      expect(recorder.mock.calls[1][0].error_code).toBe("tool_error");
+    });
+  });
+
+  describe("classifier fault", () => {
+    it("records the row as before and never throws out of the middleware", async () => {
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      // A plain object whose property reads throw: reachable only through a
+      // hostile Proxy, which a JSON parser cannot produce but proves the guard.
+      const hostile = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error("hostile");
+          },
+          get(_target, property) {
+            // `await` and promise resolution probe `then`; answer that one
+            // honestly so only the classifier's own reads can throw.
+            if (property === "then") return undefined;
+            throw new Error("hostile");
+          },
+        },
+      );
+
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+
+      const wrapped = auditing()(handlerReturning(hostile));
+      await expect(wrapped(makeRequest({ a: 1 }), context)).resolves.toBe(
+        hostile,
+      );
+      await flush();
+
+      const entry = recorder.mock.calls[0][0];
+      expect(entry.success).toBe(true);
+      expect(entry.error_code).toBeUndefined();
+      // One WARN names the fault, so a systematic classifier bug is visible.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain("Audit classifier fault");
+      warn.mockRestore();
+    });
+  });
+
+  describe("Live Logs wording", () => {
+    // The Grafana "MCP errors" panels count any metamcp line matching this as
+    // an error. In-band refusals and retirements are handled outcomes, so
+    // their lines are worded without these words and logged at warn.
+    const DASHBOARD_ERROR_WORDS = /\b(error|fatal|panic|exception)\b/i;
+
+    const recordSpy = () => vi.spyOn(metamcpLogStore, "record");
+    afterEach(() => vi.restoreAllMocks());
+
+    it("an in-band refusal logs at warn without the dashboard error words", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      await auditing()(handlerReturning(inbandResult()))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      const logged = spy.mock.calls[0][0];
+      expect(logged.level).toBe("warn");
+      expect(logged.message).toContain("refused in-band: invalid_input");
+      expect(DASHBOARD_ERROR_WORDS.test(logged.message)).toBe(false);
+    });
+
+    it("an in-band refusal with no code logs 'unclassified'", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const noCode = {
+        content: [],
+        structuredContent: { error: "provide query or entity_id" },
+      };
+
+      await auditing()(handlerReturning(noCode))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      expect(spy.mock.calls[0][0].message).toContain(
+        "refused in-band: unclassified",
+      );
+    });
+
+    it("a code token that is itself a dashboard word is not echoed", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const wordy = {
+        content: [],
+        structuredContent: { error: true, code: "error" },
+      };
+
+      await auditing()(handlerReturning(wordy))(makeRequest({ a: 1 }), context);
+
+      const logged = spy.mock.calls[0][0];
+      expect(DASHBOARD_ERROR_WORDS.test(logged.message)).toBe(false);
+      expect(logged.message).toContain("unclassified");
+    });
+
+    it("a retired-name redirect logs at warn without the dashboard error words", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const withReplacement = markRetiredToolResult(
+        { isError: true, content: [{ type: "text", text: "x" }] },
+        { replacement: "autotask__ticket_manage" },
+      );
+      const withoutReplacement = markRetiredToolResult(
+        { isError: true, content: [{ type: "text", text: "x" }] },
+        { replacement: null },
+      );
+
+      await auditing()(handlerReturning(withReplacement))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+      await auditing()(handlerReturning(withoutReplacement))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      const [first, second] = spy.mock.calls.map((call) => call[0]);
+      expect(first.level).toBe("warn");
+      expect(first.message).toContain(
+        "is retired; replacement autotask__ticket_manage",
+      );
+      expect(second.message).toContain("is retired; no replacement");
+      expect(DASHBOARD_ERROR_WORDS.test(first.message)).toBe(false);
+      expect(DASHBOARD_ERROR_WORDS.test(second.message)).toBe(false);
+    });
+
+    it("isError results keep the original error level and text", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      await auditing()(
+        handlerReturning({
+          isError: true,
+          content: [{ type: "text", text: "boom" }],
+        }),
+      )(makeRequest({ a: 1 }), context);
+
+      const logged = spy.mock.calls[0][0];
+      expect(logged.level).toBe("error");
+      expect(logged.message).toMatch(/^search returned an error \(\d+ms\)$/);
+    });
+
+    it("a success keeps the original info line", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      await auditing()(okHandler)(makeRequest({ a: 1 }), context);
+
+      const logged = spy.mock.calls[0][0];
+      expect(logged.level).toBe("info");
+      expect(logged.message).toMatch(/^search \(\d+ms\)$/);
+    });
   });
 });

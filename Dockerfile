@@ -1,12 +1,20 @@
-# Use the official uv image as base
-FROM ghcr.io/astral-sh/uv:debian AS base
+# Base image: the official uv image, digest-pinned so the build is
+# reproducible and the base layer cannot shift under us between builds. The
+# :debian tag is kept for human context; the @sha256 index digest is what
+# Docker resolves. Bumped by Dependabot's docker ecosystem (see
+# .github/dependabot.yml), which opens a reviewable PR when the tag moves.
+FROM ghcr.io/astral-sh/uv:debian@sha256:b2b767dc8bbe5b9f813ca4958a43cc8421ca8eab6c954c74e5b1e641fea7a6ad AS base
 
-# Install Node.js and pnpm directly
+# Install Node.js and pnpm directly. nodejs is pinned to an exact nodesource
+# version so the image ships a known Node build instead of "whatever 20.x is
+# current at build time"; bump it by hand when moving Node (Dependabot's
+# docker ecosystem tracks the base image digest, not apt package versions
+# inside RUN layers). pnpm is already version-pinned.
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y nodejs=20.20.2-1nodesource1 \
     && npm install -g pnpm@10.12.0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -104,11 +112,19 @@ COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
 # package.json ranges (which can silently drift from the committed lockfile).
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-lock.yaml ./
 
-# Install production dependencies only
-RUN pnpm install --prod --frozen-lockfile
-
-# Install drizzle-kit locally in backend for migrations
-RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
+# Install production dependencies only. drizzle-kit is a prod dependency of
+# apps/backend (the entrypoint runs `drizzle-kit migrate` at start), so the
+# frozen install provides it from the lockfile-resolved graph. It used to be
+# fetched here with an ad-hoc `pnpm add` outside the lockfile, which pulled an
+# unpinned, ungoverned dependency tree into the production image on every build.
+#
+# CI=1 so pnpm runs non-interactively: the copied node_modules was built with
+# dev dependencies, so switching to --prod makes pnpm purge and reinstall the
+# modules tree, and without CI that confirmation prompt stalls in the non-TTY
+# build and leaves the per-workspace node_modules (and drizzle-kit's bin)
+# unlinked. The old ad-hoc `pnpm add` masked this by triggering its own full
+# reconcile; with that gone, the prod install has to complete on its own.
+RUN CI=1 pnpm install --prod --frozen-lockfile
 
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./

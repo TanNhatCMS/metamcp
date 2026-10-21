@@ -38,6 +38,7 @@ import { createAuditingMiddleware } from "./metamcp-middleware/auditing.function
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
+  type ToolFilterCallContext,
 } from "./metamcp-middleware/filter-tools.functional";
 import {
   CallToolHandler,
@@ -45,66 +46,25 @@ import {
   ListToolsHandler,
   MetaMCPHandlerContext,
 } from "./metamcp-middleware/functional-middleware";
+import { createRetiredToolMiddleware } from "./metamcp-middleware/retired-tool.functional";
+import { createTimeoutHintMiddleware } from "./metamcp-middleware/timeout-hint.functional";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
-  mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isRecoverableBackendError } from "./session-error";
+import {
+  isRecoverableBackendError,
+  isToolCallReplaySafeError,
+} from "./session-error";
+import { ToolArgSchemaRegistry } from "./tool-arg-keys";
 import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
-import { parseToolName } from "./tool-name-parser";
+import {
+  parseToolName,
+  registerToolRoute,
+  ToolRouteOwner,
+} from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
-
-/**
- * Filter out tools that are overrides of existing tools to prevent duplicates in database
- * Uses the existing tool overrides cache for optimal performance
- */
-async function filterOutOverrideTools(
-  tools: Tool[],
-  namespaceUuid: string,
-  serverName: string,
-): Promise<Tool[]> {
-  if (!tools || tools.length === 0) {
-    return tools;
-  }
-
-  const filteredTools: Tool[] = [];
-
-  await Promise.allSettled(
-    tools.map(async (tool) => {
-      try {
-        // Check if this tool name is actually an override name for an existing tool
-        // by using the existing mapOverrideNameToOriginal function
-        const fullToolName = `${sanitizeName(serverName)}__${tool.name}`;
-        const originalName = await mapOverrideNameToOriginal(
-          fullToolName,
-          namespaceUuid,
-          true, // use cache
-        );
-
-        // If the original name is different from the current name,
-        // this tool is an override and should be filtered out
-        if (originalName !== fullToolName) {
-          // This is an override, skip it (don't save to database)
-          return;
-        }
-
-        // This is not an override, include it
-        filteredTools.push(tool);
-      } catch (error) {
-        logger.error(
-          `Error checking if tool ${tool.name} is an override:`,
-          error,
-        );
-        // On error, include the tool (fail-safe behavior)
-        filteredTools.push(tool);
-      }
-    }),
-  );
-
-  return filteredTools;
-}
 
 export const createServer = async (
   namespaceUuid: string,
@@ -113,6 +73,11 @@ export const createServer = async (
 ) => {
   const toolToClient: Record<string, ConnectedClient> = {};
   const toolToServerUuid: Record<string, string> = {};
+  // Which server first claimed each fully-qualified tool name, so a second
+  // server that sanitizes to the same prefix and exposes the same tool name is
+  // detected as a collision rather than silently overwriting the route. See
+  // the collision guard at namespace assembly below.
+  const toolNameOwner = new Map<string, ToolRouteOwner>();
   const promptToClient: Record<string, ConnectedClient> = {};
   const resourceToClient: Record<string, ConnectedClient> = {};
 
@@ -182,6 +147,10 @@ export const createServer = async (
 
     const subscriber = async (): Promise<void> => {
       toolsSyncCache.clear(mcpServerUuid);
+      // A changed backend surface invalidates the audit snapshot immediately;
+      // stale names must not remain verified until the consumer lists again.
+      toolSchemaGeneration += 1;
+      toolArgSchemas.replace([]);
       try {
         await server.notification({
           method: "notifications/tools/list_changed",
@@ -215,6 +184,8 @@ export const createServer = async (
     namespaceUuid,
     sessionId,
   };
+  const toolArgSchemas = new ToolArgSchemaRegistry();
+  let toolSchemaGeneration = 0;
 
   // Original List Tools Handler
   const originalListToolsHandler: ListToolsHandler = async (
@@ -230,6 +201,15 @@ export const createServer = async (
       context.namespaceUuid,
       includeInactiveServers,
     );
+    // A live proxy outlasts namespace edits. Drop removed owners before the
+    // collision guard so a same-named replacement can list its own tools.
+    for (const [toolName, owner] of toolNameOwner) {
+      if (!serverParams[owner.uuid]) {
+        toolNameOwner.delete(toolName);
+        delete toolToClient[toolName];
+        delete toolToServerUuid[toolName];
+      }
+    }
     const allTools: Tool[] = [];
 
     // Servers that should have contributed but didn't — used for the
@@ -337,6 +317,17 @@ export const createServer = async (
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
 
+        // The first '__' separates the server from the backend tool. A stored
+        // server name containing it cannot round-trip and could borrow an
+        // ACTIVE row on the parent prefix while listing an unreviewed tool.
+        if (sanitizeName(serverName).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
+          );
+          failedServers.push(serverName || mcpServerUuid);
+          return;
+        }
+
         try {
           const toolFetchStart = performance.now();
 
@@ -399,7 +390,10 @@ export const createServer = async (
 
           // Save original tools to database (before middleware processing)
           // This ensures we only save the actual tool names, not override names
-          // Filter out tools that are overrides of existing tools to prevent duplicates
+          // These are raw backend names. A namespace alias can match a real
+          // backend tool, so reverse-mapping here would omit that native tool
+          // from the catalog shared by every namespace. Presentation overrides
+          // belong only in the response middleware, never in this write.
           try {
             // PERFORMANCE OPTIMIZATION: Check hash FIRST to avoid expensive operations
             // Hash the FULL definitions (name + description + inputSchema); a
@@ -414,22 +408,28 @@ export const createServer = async (
               `[DEBUG-TOOLS] 🔍 Hash check for ${serverName}: ${hasChanged ? "CHANGED" : "UNCHANGED"}`,
             );
 
-            if (hasChanged) {
-              const toolsToSave = await filterOutOverrideTools(
-                allServerTools,
-                namespaceUuid,
-                serverName,
-              );
-
-              if (toolsToSave.length > 0) {
-                // Update cache with the full definitions we just observed
-                toolsSyncCache.update(mcpServerUuid, allServerTools);
-
-                // Sync with cleanup
-                await toolsImplementations.sync({
-                  tools: toolsToSave,
+            if (hasChanged && allServerTools.length > 0) {
+              // Claim the full definitions we just observed, so concurrent
+              // listings of the same set skip, then write. The write must
+              // not re-check this cache: `tools.impl` sync used to, found
+              // the hash claimed here and skipped, so this path never wrote
+              // the catalog (see syncFromListing). The claim is released if
+              // the write fails, so the next tools/list retries it instead
+              // of skipping a write that never happened.
+              toolsSyncCache.update(mcpServerUuid, allServerTools);
+              try {
+                await toolsImplementations.syncFromListing({
+                  tools: allServerTools,
                   mcpServerUuid: mcpServerUuid,
                 });
+                // A different listing can claim a newer hash while this
+                // write is in flight, then commit first. Record the set
+                // THIS completed write persisted, so a later current
+                // listing retries instead of treating a stale catalog as current.
+                toolsSyncCache.update(mcpServerUuid, allServerTools);
+              } catch (writeError) {
+                toolsSyncCache.clear(mcpServerUuid);
+                throw writeError;
               }
             }
           } catch (dbError) {
@@ -440,17 +440,44 @@ export const createServer = async (
           }
 
           // Use original tools for client response (middleware will be applied later)
-          const toolsWithSource = allServerTools.map((tool) => {
+          //
+          // Cross-server tool-name collision guard: the routing maps are keyed on
+          // `sanitizeName(serverName)__toolName`. sanitizeName strips every
+          // character outside [a-zA-Z0-9_-], so two servers in one namespace
+          // whose names sanitize to the same prefix (or share a name, or fall
+          // back to an unvalidated backend-reported version name) and expose
+          // the same tool name would produce the SAME key. Left unchecked,
+          // last writer wins and a call silently routes to the wrong backend.
+          // We keep the FIRST registration, drop the duplicate, and WARN naming
+          // both servers so the operator can rename one. Disambiguating by a
+          // uuid suffix instead was rejected: the assembly runs concurrently
+          // (Promise.allSettled below), so which server won the base name would
+          // be non-deterministic, and it would rename a tool the caller invokes
+          // by name. This synchronous loop is atomic per server relative to the
+          // others, so the check-then-set sees every already-registered server.
+          const toolsWithSource: Tool[] = [];
+          for (const tool of allServerTools) {
             const toolName = `${sanitizeName(serverName)}__${tool.name}`;
+            const outcome = registerToolRoute(
+              toolName,
+              { uuid: mcpServerUuid, name: serverName },
+              toolNameOwner,
+            );
+            if (!outcome.registered) {
+              const other = outcome.collidedWith;
+              logger.warn(
+                `Tool name collision in namespace ${namespaceUuid}: "${toolName}" is exposed by both server "${other?.name}" (${other?.uuid}) and server "${serverName}" (${mcpServerUuid}); keeping the first and dropping the duplicate. Rename one server so their sanitized name prefixes differ.`,
+              );
+              continue;
+            }
             toolToClient[toolName] = activeSession;
             toolToServerUuid[toolName] = mcpServerUuid;
-
-            return {
+            toolsWithSource.push({
               ...tool,
               name: toolName,
               description: tool.description,
-            };
-          });
+            });
+          }
 
           allTools.push(...toolsWithSource);
         } catch (error) {
@@ -481,10 +508,7 @@ export const createServer = async (
   };
 
   // Original Call Tool Handler
-  const originalCallToolHandler: CallToolHandler = async (
-    request,
-    _context,
-  ) => {
+  const originalCallToolHandler: CallToolHandler = async (request, context) => {
     const { name, arguments: args } = request.params;
 
     // Parse the tool name using shared utility
@@ -494,10 +518,22 @@ export const createServer = async (
     }
 
     const { serverName: serverPrefix, originalToolName } = parsed;
+    const { allowedToolServerUuids } = context as ToolFilterCallContext;
+    const isAllowedServer = (uuid: string): boolean =>
+      !allowedToolServerUuids || allowedToolServerUuids.includes(uuid);
 
     // Try to find the tool in pre-populated mappings first
-    let clientForTool = toolToClient[name];
-    let serverUuid = toolToServerUuid[name];
+    let clientForTool: ConnectedClient | undefined = toolToClient[name];
+    let serverUuid: string | undefined = toolToServerUuid[name];
+    if (serverUuid && !isAllowedServer(serverUuid)) {
+      // The filter checked today's mounts, but this live proxy may retain the
+      // removed server's route. Resolve again instead of executing that client.
+      delete toolToClient[name];
+      delete toolToServerUuid[name];
+      toolNameOwner.delete(name);
+      clientForTool = undefined;
+      serverUuid = undefined;
+    }
 
     // If not found in mappings, dynamically find the server and route the call
     if (!clientForTool || !serverUuid) {
@@ -510,6 +546,7 @@ export const createServer = async (
 
         // Find the server with the matching name prefix
         for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
+          if (!isAllowedServer(mcpServerUuid)) continue;
           const session = await mcpServerPool.getSession(
             sessionId,
             mcpServerUuid,
@@ -644,6 +681,13 @@ export const createServer = async (
         // entirely — no wait — when the DB has no record of this tool:
         // that's a genuinely unknown tool, not a reconnect race, and it
         // must still 404 immediately.
+        //
+        // The candidates are ACTIVE mapping rows only
+        // (findServersForNamespaceToolName), so this never warms or routes
+        // a server whose row for the tool is switched off, nor, under the
+        // `allowlist` tool policy, one with no row. The filter middleware
+        // already refused those by name; the query keeps the server this
+        // picks inside the same rule rather than relying on that.
         if (!clientForTool) {
           const candidates =
             await namespacesRepository.findServersForNamespaceToolName(
@@ -652,6 +696,7 @@ export const createServer = async (
             );
           const match = candidates.find(
             (candidate) =>
+              isAllowedServer(candidate.serverUuid) &&
               sanitizeName(candidate.serverName || "") === serverPrefix,
           );
           const paramsForMatch = match
@@ -732,7 +777,16 @@ export const createServer = async (
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
     } catch (error) {
-      if (!isRecoverableBackendError(error)) {
+      // Replay a tools/call ONLY when the failure proves the backend never
+      // ran it: an HTTP 404 "Session not found" answer to the POST, or a
+      // transport already closed before the send. A tool call is not
+      // idempotent (a delete, a reboot, a password reset), so a timeout, a
+      // connection dropped mid-call or a 5xx surfaces to the client instead:
+      // the backend may have executed it, and a second send runs it twice.
+      // The 2026-09-30 client-side duplicate prompted finding this separate
+      // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
+      // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
+      if (!isToolCallReplaySafeError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${
             clientForTool.client.getServerVersion()?.name || "unknown"
@@ -743,7 +797,7 @@ export const createServer = async (
       }
 
       logger.warn(
-        `Backend connection lost for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+        `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; invalidating pool and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
@@ -805,20 +859,49 @@ export const createServer = async (
 
   const callToolWithMiddleware = compose(
     // Outermost: records every call (incl. denied) to the Live Logs store.
-    createAuditingMiddleware(),
+    createAuditingMiddleware((name) => toolArgSchemas.get(name)),
+    // Second, OUTSIDE the filter so it also sees the filter's fail-closed
+    // denial for a deleted server: answers a call that already failed as an
+    // unknown tool with the replacement from the retired-tool map. Consulted
+    // only AFTER a failure, so it cannot shadow a live tool.
+    createRetiredToolMiddleware(),
+    // Override names resolve BEFORE the filter, so the INACTIVE check judges
+    // the tool that will actually run. With the filter outside this, a call
+    // by an override name (`<server>__<alias>`) reached the filter as the
+    // alias, found no mapping row for it, read that as "allowed", and was then
+    // routed to the original tool, so a tool curated INACTIVE stayed callable
+    // by its alias while its real name was refused. This mirrors the list
+    // chain above, where the filter also runs on the real names, inside the
+    // rename. A name that is not an override passes this middleware unchanged,
+    // so the filter sees exactly the name it saw before; an alias call is
+    // refused with the same text its real name gets (it names the real tool).
+    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>
         `Access denied to tool "${toolName}": ${reason}`,
     }),
-    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
+    // Innermost, directly around the routing handler: adds text to the
+    // SDK-shaped -32001 timeout saying the outcome is unknown and a write's
+    // target should be read before a retry. Same code, same data; text only.
+    createTimeoutHintMiddleware(),
     // Add more middleware here as needed
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);
 
   // Set up the handlers with middleware
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
-    return await listToolsWithMiddleware(request, handlerContext);
+    const generation = ++toolSchemaGeneration;
+    toolArgSchemas.replace([]);
+    const result = await listToolsWithMiddleware(request, handlerContext);
+    // Use final names after filters and overrides, and discard removed names.
+    // Another proxy's listing cannot teach this routing instance a schema.
+    // A notification or overlapping listing makes an older response unsafe to
+    // retain. Counts-only is honest until a fresh uncontested listing arrives.
+    toolArgSchemas.replace(
+      generation === toolSchemaGeneration ? result.tools : [],
+    );
+    return result;
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

@@ -13,6 +13,8 @@
   "done": "完成",
   "apiKeyCreated": "API 密钥创建成功",
   "apiKeyDeleted": "API 密钥删除成功",
+  "apiKeyDeactivated": "API 密钥已停用",
+  "apiKeyReactivated": "API 密钥已重新启用",
   "createError": "创建 API 密钥失败",
   "deleteError": "删除 API 密钥失败",
   "copyToClipboard": "已复制到剪贴板",
@@ -22,6 +24,8 @@
   "lastUsed": "最后使用",
   "actions": "操作",
   "delete": "删除",
+  "deactivate": "停用",
+  "reactivate": "重新启用",
   "confirmDelete": "您确定要删除此 API 密钥吗？",
   "deleteConfirmation": "此操作无法撤消。使用此 API 密钥的应用程序将失去访问权限。",
   "cancel": "取消",
@@ -45,5 +49,8 @@
   "actsAsUserDescription": "可选，仅限管理员。使用此密钥认证的请求将以该用户身份执行委托的 M365 调用。需要选择特定端点范围，且密钥必须由该用户拥有——公共（所有人）密钥不可绑定身份。未绑定时密钥保持安全关闭（无委托身份）。",
   "actsAsBadge": "身份:",
   "roleLoadError": "无法确定您的权限。",
-  "retryRoleLoad": "重试"
+  "retryRoleLoad": "重试",
+  "adminPlane": "管理平面（控制平面 / CI）密钥",
+  "adminPlaneDescription": "仅限管理员。作为其所有者在控制平面（/trpc）上进行身份验证，用于 CI 和自动化。在数据平面上被拒绝。与端点范围和代理身份互斥，且必须由管理员拥有。",
+  "adminPlaneBadge": "控制平面"
 }

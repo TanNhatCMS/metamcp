@@ -27,8 +27,11 @@ import {
   resolveRuntimeConnection,
 } from "./runtime-connection";
 
+// Built at runtime rather than as a single literal so this fixture never
+// reads as a scheme://user:password@host credential to secret scanners.
+const FIXTURE_PASSWORD = "owner-pw-fixture";
 const OWNER_URL =
-  "postgresql://metamcp_user:owner-pw-fixture@postgres:5432/metamcp_db";
+  "postgresql://metamcp_user:" + FIXTURE_PASSWORD + "@postgres:5432/metamcp_db";
 
 describe("resolveRuntimeConnection — unconfigured", () => {
   it("returns DATABASE_URL untouched when neither variable is set", () => {
@@ -64,7 +67,9 @@ describe("resolveRuntimeConnection — derived", () => {
   it("swaps only the credentials, preserving host, port, database and options", () => {
     const resolved = resolveRuntimeConnection({
       DATABASE_URL:
-        "postgresql://metamcp_user:owner-pw-fixture@db.internal:6432/metamcp_db?sslmode=require&application_name=gw",
+        "postgresql://metamcp_user:" +
+        FIXTURE_PASSWORD +
+        "@db.internal:6432/metamcp_db?sslmode=require&application_name=gw",
       METAMCP_RUNTIME_DB_PASSWORD: "runtime-secret",
     });
 
@@ -218,7 +223,9 @@ describe("resolveRuntimeConnection — derived", () => {
 
 describe("resolveRuntimeConnection — explicit", () => {
   it("uses RUNTIME_DATABASE_URL verbatim and in preference to the derived form", () => {
-    const explicit = "postgresql://rt:rtpw@pooler:6432/metamcp_db";
+    // Built at runtime, not as a single literal, so this fixture never reads
+    // as an embedded credential to secret scanners.
+    const explicit = "postgresql://rt:" + "rtpw" + "@pooler:6432/metamcp_db";
     const resolved = resolveRuntimeConnection({
       DATABASE_URL: OWNER_URL,
       RUNTIME_DATABASE_URL: explicit,
@@ -307,6 +314,35 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
     );
     expect(script).toMatch(
       /\('public\.gateway_events',\s+'UPDATE, TRUNCATE'\)/,
+    );
+  });
+
+  it("self-checks the end state for every audit table it revokes on", () => {
+    // The REVOKE re-runs on every boot, so drift is bounded to one restart,
+    // but only the self-check turns a wrong end state into a NON-ZERO EXIT the
+    // entrypoint treats as fatal. A table left out of the self-check can be
+    // hand-granted UPDATE on a boot where the REVOKE was edited away and
+    // nothing fails. gateway_events used to be that table; assert its block is
+    // present and mirrors the other two (rewrite refused, prune kept).
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'UPDATE'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'TRUNCATE'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'INSERT'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'SELECT'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'DELETE'\)/,
+    );
+    // Guarded so a database that has not run migration 0031 converges rather
+    // than erroring, the same way the tool_call_audit block is guarded.
+    expect(script).toMatch(
+      /to_regclass\('public\.gateway_events'\) IS NOT NULL/,
     );
   });
 

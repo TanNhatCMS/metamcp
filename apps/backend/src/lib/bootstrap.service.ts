@@ -17,6 +17,12 @@ import {
 import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import { emitAdminEvent } from "./audit/admin-event";
 import { setBootstrapSignupAllowed } from "./bootstrap-signup-override";
+import {
+  MIN_BOOTSTRAP_PASSWORD_LENGTH,
+  SHIPPED_PLACEHOLDER_AUTH_SECRET,
+  SHIPPED_PLACEHOLDER_PASSWORDS,
+  shouldRefuseBootstrapPasswordInProduction,
+} from "./shipped-placeholders";
 
 /**
  * Environment-based bootstrap for MetaMCP.
@@ -65,6 +71,12 @@ export interface PreservedApiKey {
   endpoint_name: string | null;
   acts_as_user_id: string | null;
   acts_as_email: string | null;
+  // Plane flag (migration 0038). Preserved verbatim so a control-plane (CI) key
+  // keeps its plane across a recreate, without it a recreate would silently
+  // DEMOTE the key to a data-plane key that then fails on /trpc. It carries no
+  // scope or acts-as to re-resolve (the CHECK constraints forbid both on an
+  // admin-plane row), so unlike endpoint_uuid/acts_as it restores as-is.
+  admin_plane: boolean;
 }
 
 /** One key restore that could not be performed, with why — surfaced loudly. */
@@ -114,6 +126,7 @@ export function planPreservedApiKeyRestores(
     is_active: boolean;
     endpoint_uuid: string | null;
     acts_as_user_id: string | null;
+    admin_plane: boolean;
   }[];
   skipped: SkippedApiKeyRestore[];
 } {
@@ -125,6 +138,7 @@ export function planPreservedApiKeyRestores(
     is_active: boolean;
     endpoint_uuid: string | null;
     acts_as_user_id: string | null;
+    admin_plane: boolean;
   }[] = [];
   const skipped: SkippedApiKeyRestore[] = [];
 
@@ -175,6 +189,9 @@ export function planPreservedApiKeyRestores(
       is_active: k.is_active,
       endpoint_uuid: resolvedEndpointUuid,
       acts_as_user_id: resolvedActsAsUserId,
+      // Preserved verbatim (migration 0038): an admin-plane key carries no
+      // scope or identity to re-resolve, so its plane restores as-is.
+      admin_plane: k.admin_plane,
     });
   }
 
@@ -793,6 +810,9 @@ async function ensureUser(
             // PreservedApiKey doc comment).
             acts_as_user_id: apiKeysTable.acts_as_user_id,
             acts_as_email: actsAsUsers.email,
+            // Plane flag (migration 0038): preserved verbatim so a control-plane
+            // (CI) key is not silently demoted to a data-plane key on recreate.
+            admin_plane: apiKeysTable.admin_plane,
           })
           .from(apiKeysTable)
           .leftJoin(
@@ -823,6 +843,7 @@ async function ensureUser(
               endpoint_name: row.endpoint_name ?? null,
               acts_as_user_id: row.acts_as_user_id ?? null,
               acts_as_email: row.acts_as_email ?? null,
+              admin_plane: row.admin_plane,
             });
           } else {
             foreignBoundKeyNames.push(row.name);
@@ -1085,6 +1106,10 @@ async function restorePreservedApiKeys(
               // Same for the identity binding — a conflicting row must not
               // keep a stale (or NULL) acts-as identity.
               acts_as_user_id: values.acts_as_user_id,
+              // Restore the plane too (migration 0038): a conflicting row must
+              // not keep a stale plane, or a preserved control-plane key could
+              // silently come back as a data-plane key.
+              admin_plane: values.admin_plane,
             },
           });
         restored++;
@@ -1572,39 +1597,15 @@ async function bootstrapEndpoints(
 }
 
 /**
- * Passwords that `example.env` has, at some point, shipped for the BOOTSTRAP
- * ADMINISTRATOR account.
- *
- * `changeme` was the shipped default for the whole life of the file, so it is
- * the first password anyone who has read this repository would try against a
- * MetaMCP deployment, and a deployment that copied `example.env` and edited
- * only the lines it noticed would still be running it. The replacement
- * placeholder is listed for exactly the same reason: it is public, so it is
- * guessable, and the point of a placeholder is that it must never survive to
- * a running install.
- *
- * WARN rather than refuse, deliberately. This account is created at boot, so a
- * hard failure would brick a deliberate throwaway local dev stack, and the
- * common case here is a first-run operator who needs to be TOLD, not stopped.
- * The warning is written to be impossible to skim past.
- */
-const SHIPPED_PLACEHOLDER_PASSWORDS = new Set([
-  "changeme",
-  "REPLACE_ME__generate_a_strong_password",
-]);
-
-/**
- * Deliberately its own constant rather than a member of the set above: this
- * value is a signing key, and `example.env` gives it a distinct placeholder so
- * one find-and-replace cannot set the database password and the session
- * signing key to the same string.
- */
-const SHIPPED_PLACEHOLDER_AUTH_SECRET = "REPLACE_ME__generate_a_signing_key";
-
-/**
  * Warn, loudly, if a bootstrap account is being created with a password this
  * repository publishes. Returns whether it warned, so a test can assert the
  * warning rather than the predicate behind it.
+ *
+ * The placeholder set and signing-key constant live in `./shipped-placeholders`
+ * so `auth.ts` can share them without an import cycle (that module imports this
+ * one). This is the dev-facing half: outside production a placeholder is a loud
+ * warning so a throwaway local stack still boots; production refuses instead
+ * (see `validateConfig` and `auth.ts`).
  *
  * Exported for that test only; `validateConfig` below is the sole production
  * caller and covers every configured user, so `BOOTSTRAP_USERS` entries are
@@ -1700,15 +1701,39 @@ function validateConfig(config: EnvConfig): void {
 
   // Validate users
   for (const user of config.users) {
+    // Production hard guard: this account is created as an
+    // administrator, so a placeholder or sub-8-character password in production
+    // would stand up an admin whose credential is published in the repository
+    // or trivially guessable. Refuse it rather than warn. Outside production
+    // the warn-only path below still runs, so a throwaway local stack boots.
+    // A throw here aborts the bootstrap pass, so the insecure account is never
+    // created; whether the process then exits is governed by BOOTSTRAP_FAIL_HARD
+    // (see lib/startup). The signing-key twin of this guard is fatal
+    // unconditionally at module load in auth.ts, because a placeholder there is
+    // a running-gateway total-bypass rather than a bootstrap-config problem.
+    if (
+      shouldRefuseBootstrapPasswordInProduction(
+        user.password,
+        process.env.NODE_ENV,
+      )
+    ) {
+      throw new Error(
+        `Refusing to create bootstrap user ${user.email ?? "(no email)"} in ` +
+          `production: the password is a placeholder published in example.env ` +
+          `or is fewer than ${MIN_BOOTSTRAP_PASSWORD_LENGTH} characters. Set a ` +
+          `real BOOTSTRAP_USER_PASSWORD (or the password in BOOTSTRAP_USERS) ` +
+          `and restart.`,
+      );
+    }
     if (!user.email || user.email.trim() === "") {
       console.warn("⚠️ User configuration is missing 'email' field");
     }
     if (!user.password || user.password.trim() === "") {
       console.warn(`⚠️ User ${user.email} is missing 'password' field`);
     }
-    if (user.password && user.password.length < 8) {
+    if (user.password && user.password.length < MIN_BOOTSTRAP_PASSWORD_LENGTH) {
       console.warn(
-        `⚠️ Password for ${user.email} is less than 8 characters. Consider using a stronger password.`,
+        `⚠️ Password for ${user.email} is less than ${MIN_BOOTSTRAP_PASSWORD_LENGTH} characters. Consider using a stronger password.`,
       );
     }
     warnOnPlaceholderBootstrapPassword(user.email, user.password);
