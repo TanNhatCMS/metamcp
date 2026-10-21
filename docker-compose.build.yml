@@ -1,0 +1,20 @@
+# Build-from-source override for docker-compose.yml.
+#
+# The base compose runs the published fork image
+# (ghcr.io/tannhatcms/metamcp:latest, pull_policy: always). Layering this
+# file on top builds the image from the local checkout instead and pins
+# the locally built tag, so `up` never replaces it with the registry one:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+#
+# `./docker.sh build` wraps exactly that. The local tag is separate from
+# :latest on purpose: a source build must not masquerade as the published
+# image, and `docker.sh update` (registry flow) stays unaffected.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/tannhatcms/metamcp:local
+    pull_policy: never

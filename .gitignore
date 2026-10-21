@@ -53,3 +53,8 @@ compose.override.yml
 # a test run from the repo root must not leave them tracked.
 /app.log*
 /error.log*
+
+# docker.sh first-run artifacts: the generated bootstrap admin password and
+# local database backups must never be committed.
+.bootstrap-admin-password
+/backups/
