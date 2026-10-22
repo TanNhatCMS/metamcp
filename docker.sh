@@ -86,6 +86,10 @@ ensure_env() {
   [ -f example.env ] || die "example.env not found — run this from the repo root of a full checkout."
   log "First run: creating .env from example.env with generated secrets..."
   cp example.env .env
+  # Phòng thủ sâu: Docker Compose không strip inline comment trong env_file,
+  # nên cắt đuôi " #..." trên các dòng KEY=value (bỏ qua dòng comment thuần) —
+  # tránh value rác lọt vào cấu hình app.
+  sed -i '/^[[:space:]]*#/!s/[[:space:]]#.*$//' .env
   local pg_pw auth_secret admin_pw
   pg_pw="$(gen_secret)"
   auth_secret="$(gen_secret)"
