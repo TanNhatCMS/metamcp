@@ -28,6 +28,10 @@ ENV NEXT_TELEMETRY_DISABLED 1
 # Copy root package files
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY turbo.json ./
+# pnpmfile is required for --frozen-lockfile: pnpm-lock.yaml records a
+# pnpmfileChecksum, and without this file the frozen install fails with
+# ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (seen in the 2026-10-25 flex build).
+COPY .pnpmfile.cjs ./
 
 # Copy package.json files from all workspaces
 COPY apps/frontend/package.json ./apps/frontend/
@@ -111,6 +115,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
 # pin prod deps to the already-resolved graph instead of re-resolving
 # package.json ranges (which can silently drift from the committed lockfile).
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-lock.yaml ./
+# Same pnpmfile requirement as the deps stage: the prod --frozen-lockfile
+# install below also verifies pnpmfileChecksum.
+COPY --chown=nextjs:nodejs .pnpmfile.cjs ./
 
 # Install production dependencies only. drizzle-kit is a prod dependency of
 # apps/backend (the entrypoint runs `drizzle-kit migrate` at start), so the
